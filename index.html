@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Glass — Preview</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        min-height: 100%;
+        /* warm neutral surround, tuned to the app's umber substrate rather than iOS grey */
+        background: radial-gradient(120% 90% at 50% 0%, #24211f 0%, #141312 55%, #0d0c0c 100%);
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+
+      /* Desktop: show the app centered inside an iPhone-shaped mockup frame */
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 40px 16px;
+      }
+
+      .phone-frame {
+        position: relative;
+        width: 393px;
+        height: 852px;
+        background: #000;
+        border-radius: 55px;
+        padding: 14px;
+        box-shadow:
+          0 0 0 2px #37332f,
+          0 0 0 3px rgba(243, 201, 140, 0.06),
+          0 44px 90px -20px rgba(0, 0, 0, 0.85),
+          0 12px 26px rgba(0, 0, 0, 0.5);
+        flex-shrink: 0;
+      }
+
+      /* side buttons */
+      .phone-frame::before {
+        /* power button */
+        content: "";
+        position: absolute;
+        right: -4px;
+        top: 200px;
+        width: 4px;
+        height: 90px;
+        background: #2b2725;
+        border-radius: 2px 0 0 2px;
+      }
+      .phone-frame::after {
+        /* mute switch */
+        content: "";
+        position: absolute;
+        left: -4px;
+        top: 130px;
+        width: 4px;
+        height: 32px;
+        background: #2b2725;
+        border-radius: 0 2px 2px 0;
+      }
+
+      .phone-screen {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        background: #0A0705;
+        border-radius: 44px;
+        overflow: hidden;
+        /* establishes a containing block so the app's position:fixed
+           elements (tab bar, toasts) anchor to the phone screen instead
+           of the browser viewport */
+        transform: translateZ(0);
+      }
+
+      .dynamic-island {
+        position: absolute;
+        top: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 126px;
+        height: 37px;
+        background: #000;
+        border-radius: 20px;
+        z-index: 1000;
+      }
+
+      .home-indicator {
+        position: absolute;
+        bottom: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 134px;
+        height: 5px;
+        background: rgba(255, 255, 255, 0.9);
+        border-radius: 3px;
+        z-index: 1000;
+        pointer-events: none;
+      }
+
+      #root {
+        position: absolute;
+        inset: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      /* On an actual phone (or narrow window), drop the mockup chrome
+         and just render the app full-screen like a real installed app. */
+      @media (max-width: 480px) {
+        body { padding: 0; }
+        .phone-frame {
+          width: 100vw;
+          height: 100vh;
+          height: 100dvh;
+          border-radius: 0;
+          padding: 0;
+          box-shadow: none;
+        }
+        .phone-screen { border-radius: 0; }
+        .dynamic-island, .home-indicator { display: none; }
+        .phone-frame::before, .phone-frame::after { display: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="phone-frame">
+      <div class="phone-screen">
+        <div class="dynamic-island"></div>
+        <div id="root"></div>
+        <div class="home-indicator"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
