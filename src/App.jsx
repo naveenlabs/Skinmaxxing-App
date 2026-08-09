@@ -1012,9 +1012,6 @@ export default function App() {
         <SignInScreen
           onGoogle={auth.signInWithGoogle}
           onGuest={auth.continueAsGuest}
-          onSendCode={auth.sendCode}
-          onVerifyCode={auth.verifyCode}
-          authEnabled={auth.authEnabled}
           error={auth.error}
           onDismissError={auth.clearError}
         />
@@ -1219,7 +1216,6 @@ export default function App() {
             quotaUsedMB={quotaUsedMB}
             quotaPct={quotaPct}
             quotaTotalMB={quotaTotalMB}
-          quotaTotalMB={quotaTotalMB}
             onClose={() => setAccountOpen(false)}
             onSignIn={auth.signInWithGoogle}
             onSignOut={async () => { setAccountOpen(false); await auth.signOut(); }}
@@ -5602,9 +5598,8 @@ function AccountButton({ monogram, avatarUrl, onClick }) {
   );
 }
 
-function SignInScreen({ onGoogle, onGuest, onSendCode, onVerifyCode, authEnabled, error, onDismissError }) {
+function SignInScreen({ onGoogle, onGuest, error, onDismissError }) {
   const [busy, setBusy] = useState(false);
-  const [codeOpen, setCodeOpen] = useState(false);
 
   async function go() {
     setBusy(true);
@@ -5697,20 +5692,6 @@ function SignInScreen({ onGoogle, onGuest, onSendCode, onVerifyCode, authEnabled
             {busy ? "Opening Google…" : "Continue with Google"}
           </motion.button>
 
-          {authEnabled && (
-            <button
-              onClick={() => setCodeOpen(true)}
-              className="u-tap"
-              style={{
-                display: "block", width: "100%", marginTop: 12, padding: "11px 0",
-                borderRadius: 14, border: "1px solid var(--line-2)", background: "transparent",
-                color: "var(--text)", fontSize: 13, fontWeight: 600,
-              }}
-            >
-              Email me a code instead
-            </button>
-          )}
-
           <button
             onClick={onGuest}
             className="u-tap"
@@ -5727,179 +5708,7 @@ function SignInScreen({ onGoogle, onGuest, onSendCode, onVerifyCode, authEnabled
           </p>
         </motion.div>
       </div>
-
-      <AnimatePresence>
-        {codeOpen && (
-          <CodeSignInSheet
-            onSend={onSendCode}
-            onVerify={onVerifyCode}
-            onClose={() => setCodeOpen(false)}
-          />
-        )}
-      </AnimatePresence>
     </div>
-  );
-}
-
-const RESEND_COOLDOWN_S = 45;
-const MAX_CODE_ATTEMPTS = 5;
-
-/**
- * The second door. A full-page redirect is the only OAuth shape an installed iOS PWA
- * handles reliably, and even that has been known to strand people in an in-app browser —
- * a six-digit code involves no redirect at all, so it works everywhere.
- *
- * Requesting a code behaves identically for a known and an unknown address; nothing here
- * reveals whether an account exists.
- */
-function CodeSignInSheet({ onSend, onVerify, onClose }) {
-  const [step, setStep] = useState("email");
-  const [email, setEmail] = useState("");
-  const [code, setCode] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-  const [attempts, setAttempts] = useState(0);
-  const [cooldown, setCooldown] = useState(0);
-
-  useEffect(() => {
-    if (cooldown <= 0) return undefined;
-    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
-    return () => clearTimeout(t);
-  }, [cooldown]);
-
-  async function send(isResend) {
-    if (busy || cooldown > 0) return;
-    setBusy(true);
-    setError(null);
-    const r = await onSend(email);
-    setBusy(false);
-    if (!r.ok) { setError(r.error); return; }
-    setStep("code");
-    setCooldown(RESEND_COOLDOWN_S);
-    if (isResend) { setCode(""); setAttempts(0); }
-  }
-
-  async function verify() {
-    if (busy) return;
-    if (attempts >= MAX_CODE_ATTEMPTS) {
-      setError("Too many attempts. Request a new code.");
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    const r = await onVerify(email, code);
-    setBusy(false);
-    if (!r.ok) {
-      setAttempts((a) => a + 1);
-      setError(r.error);
-      return;
-    }
-    // Success closes itself: the auth state change swaps the whole screen out.
-  }
-
-  const inputStyle = {
-    width: "100%", padding: "13px 14px", borderRadius: 14,
-    background: "rgba(255,255,255,0.04)", border: "1px solid var(--line-2)",
-    color: "var(--text)", fontSize: 15,
-  };
-
-  return (
-    <Sheet onClose={onClose} z={158} labelledBy="code-title">
-      <SheetHeader
-        id="code-title"
-        title={step === "email" ? "Sign in with a code" : "Check your email"}
-        subtitle={step === "email"
-          ? "We'll email you a six-digit code. No password, no redirect."
-          : `We sent a six-digit code to ${email}.`}
-        onClose={onClose}
-      />
-
-      <AnimatePresence>
-        {error && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.2 }}
-            role="alert"
-            style={{ overflow: "hidden" }}
-          >
-            <div style={{
-              display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 12,
-              padding: "11px 13px", borderRadius: 14,
-              background: "var(--rose-wash)", border: "1px solid rgba(226,160,141,0.3)",
-            }}>
-              <AlertTriangle size={14} color="var(--rose)" style={{ flexShrink: 0, marginTop: 1 }} />
-              <span style={{ fontSize: 12, color: "var(--text-2)", lineHeight: 1.5 }}>{error}</span>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {step === "email" ? (
-        <>
-          <input
-            type="email"
-            inputMode="email"
-            autoComplete="email"
-            autoFocus
-            aria-label="Email address"
-            placeholder="you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") send(false); }}
-            style={{ ...inputStyle, marginBottom: 14 }}
-          />
-          <PrimaryButton onClick={() => send(false)} disabled={busy || !email}>
-            {busy ? "Sending…" : "Email me a code"}
-          </PrimaryButton>
-        </>
-      ) : (
-        <>
-          <input
-            type="text"
-            inputMode="numeric"
-            autoComplete="one-time-code"
-            autoFocus
-            maxLength={6}
-            aria-label="Six-digit code"
-            placeholder="000000"
-            value={code}
-            onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-            onKeyDown={(e) => { if (e.key === "Enter") verify(); }}
-            className="u-num"
-            style={{
-              ...inputStyle, marginBottom: 14,
-              textAlign: "center", fontSize: 26, letterSpacing: "0.34em", fontWeight: 600,
-            }}
-          />
-          <PrimaryButton onClick={verify} disabled={busy || code.length < 6}>
-            {busy ? "Checking…" : "Verify and sign in"}
-          </PrimaryButton>
-          <button
-            onClick={() => send(true)}
-            disabled={cooldown > 0 || busy}
-            className="u-tap"
-            style={{
-              display: "block", width: "100%", marginTop: 14, padding: "8px 0",
-              background: "none", border: "none",
-              fontSize: 12.5, color: cooldown > 0 ? "var(--text-3)" : "var(--gold)",
-              fontWeight: 500, opacity: cooldown > 0 ? 0.6 : 1,
-            }}
-          >
-            {cooldown > 0 ? `Send another code in ${cooldown}s` : "Send another code"}
-          </button>
-          <button
-            onClick={() => { setStep("email"); setCode(""); setError(null); setAttempts(0); }}
-            className="u-tap"
-            style={{
-              display: "block", width: "100%", marginTop: 2, padding: "6px 0",
-              background: "none", border: "none", fontSize: 12, color: "var(--text-3)",
-            }}
-          >
-            Use a different email
-          </button>
-        </>
-      )}
-    </Sheet>
   );
 }
 
@@ -6081,6 +5890,10 @@ function AccountView({
   const avatarSrc = avatarDataUrl || (!googleAvatarBroken && !isGuest ? profile?.avatarUrl : "") || "";
   const hasOwnAvatar = !!avatarDataUrl;
 
+  const knownName = greetingName || (!isGuest && profile?.fullName) || "";
+  const hasName = !!knownName;
+  const shownName = knownName || "Add your name";
+
   return (
     <motion.div
       initial={{ x: reduce ? 0 : "100%", opacity: reduce ? 0 : 1 }}
@@ -6148,8 +5961,28 @@ function AccountView({
                 </span>
               </motion.button>
 
-              <div className="u-display" style={{ fontSize: 27, color: "var(--text)" }}>
-                {greetingName || (!isGuest && profile?.fullName) || "You"}
+              {/* The name is the thing people actually want to change, so it's the
+                  control. A guest with no name got a dead "You" here and had to find the
+                  Preferences row to do anything about it — which nobody did. */}
+              <div style={{ display: "flex", justifyContent: "center" }}>
+                <motion.button
+                  onClick={() => setShowName(true)}
+                  whileTap={{ scale: 0.97 }}
+                  transition={SPRING}
+                  aria-label={hasName ? "Change your name" : "Add your name"}
+                  className="u-tap"
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 9,
+                    background: "none", border: "none", padding: "1px 2px",
+                  }}
+                >
+                  <span className="u-display" style={{
+                    fontSize: 27, color: hasName ? "var(--text)" : "var(--text-2)",
+                  }}>
+                    {shownName}
+                  </span>
+                  <Pencil size={13} color="var(--text-3)" style={{ flexShrink: 0 }} />
+                </motion.button>
               </div>
               <div style={{ fontSize: 12.5, color: "var(--text-3)", marginTop: 6 }}>
                 {isGuest ? "Not signed in — everything is on this phone" : profile?.email}

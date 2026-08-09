@@ -1,4 +1,5 @@
-// Guest lifecycle, guest→account conversion, profile pictures and email-code sign-in.
+// Guest lifecycle, guest→account conversion, profile pictures, and the fact that Google
+// is the only way in.
 //
 // The conversion cases are the ones worth being careful about: carrying guest data into
 // a brand-new account has to be offered rather than assumed, signing into an account that
@@ -50,8 +51,7 @@ page.on("console", (m) => {
 
 let rows = new Map();
 const writes = [];
-let otpSends = 0;
-let acceptCode = "654321";
+let otpSends = 0; // must stay at zero: there is no email door any more
 
 await page.route("**/rest/v1/user_state*", (route) => {
   const req = route.request();
@@ -79,12 +79,7 @@ await page.route("**/storage/v1/**", (route) => {
 await page.route("**/auth/v1/**", (route) => {
   const url = route.request().url();
   const J = (status, body) => route.fulfill({ status, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  if (/\/auth\/v1\/otp/.test(url)) { otpSends++; return J(200, {}); }
-  if (/\/auth\/v1\/verify/.test(url)) {
-    let b = {}; try { b = JSON.parse(route.request().postData() || "{}"); } catch { /* ignore */ }
-    if (b.token === acceptCode) return J(200, { ...session(), user: userObj() });
-    return J(400, { error: "invalid_grant", error_description: "Token has expired or is invalid" });
-  }
+  if (/\/auth\/v1\/(otp|verify)/.test(url)) { otpSends++; return J(200, {}); }
   if (/\/auth\/v1\/user/.test(url)) return J(200, userObj());
   return J(200, {});
 });
@@ -243,33 +238,48 @@ await page.waitForTimeout(1800);
 check("exiting lands on the sign-in screen", (await bodyText()).includes("Continue with Google"));
 check("guest data was not deleted", await page.evaluate(() => !!localStorage.getItem("glass:nv-products")));
 
-/* ========================== 6. email code sign-in ========================== */
+/* ==================== 6. Google is the only way in ==================== */
+// The email-code door was removed on request. This asserts it stayed removed: no
+// affordance on the sign-in screen, and nothing in the app ever calls the OTP endpoints.
 
-await page.getByText("Email me a code instead").click();
+const signInText = await bodyText();
+check("Google is offered", /Continue with Google/.test(signInText));
+check("no email-code door", !/code|six-digit|Email me/i.test(signInText), signInText.slice(0, 200));
+check("guest escape hatch survives", /Continue without an account/.test(signInText));
+check("no OTP request was ever made", otpSends === 0, String(otpSends));
+await page.screenshot({ path: `${OUT}/shots/account-signin.png` });
+
+/* ==================== 7. a guest can give themselves a name ==================== */
+// Previously the account header read a dead "You" for a guest and the only way to change
+// it was a Preferences row nobody found.
+
+await page.evaluate(() => { localStorage.clear(); localStorage.setItem("glass:auth-mode", "guest"); });
+await seedGuest(GUEST_MARK);
+await page.reload({ waitUntil: "networkidle" });
+await page.waitForTimeout(2000);
+check("an unnamed guest is greeted generically", /Good (Morning|Afternoon|Evening),\s*you\./i.test(await bodyText()));
+
+await page.getByLabel("Your account").first().click();
+await page.waitForTimeout(900);
+check("the header invites a name instead of saying \"You\"", /Add your name/i.test(await bodyText()));
+await page.screenshot({ path: `${OUT}/shots/account-guest-unnamed.png` });
+
+await page.getByRole("button", { name: "Add your name" }).click();
 await page.waitForTimeout(700);
-check("code sheet opens", /Sign in with a code/i.test(await bodyText()));
-await page.getByLabel("Email address").fill("dana@example.com");
-await page.getByText("Email me a code", { exact: true }).click();
-await page.waitForTimeout(1500);
-check("a code was requested", otpSends === 1, String(otpSends));
-check("moves to the code step", /Check your email/i.test(await bodyText()));
-await page.screenshot({ path: `${OUT}/shots/account-code.png` });
+check("tapping the name opens the editor", /What should we call you/i.test(await bodyText()));
+await page.getByLabel("Display name").fill("Dana");
+await page.getByRole("button", { name: "Save" }).click();
+await page.waitForTimeout(900);
+check("the name shows in the account header", /Dana/.test(await bodyText()));
 
-await page.getByLabel("Six-digit code").fill("111111");
-await page.getByText("Verify and sign in").click();
-await page.waitForTimeout(1500);
-check("a wrong code is rejected", /isn't right|expired/i.test(await bodyText()), (await bodyText()).slice(0, 160));
-check("rejection does not reveal whether the account exists",
-  !/no account|not found|unknown|already registered/i.test(await bodyText()));
+await page.getByLabel("Back").click();
+await page.waitForTimeout(700);
+check("the greeting uses it", /Good (Morning|Afternoon|Evening),\s*Dana\./i.test(await bodyText()), (await bodyText()).slice(0, 120));
 
-const resendLabel = await page.evaluate(() =>
-  [...document.querySelectorAll("button")].map((b) => b.textContent).find((t) => /Send another code/.test(t || "")));
-check("resend is on a cooldown", /in \d+s/.test(resendLabel || ""), String(resendLabel));
-
-await page.getByLabel("Six-digit code").fill(acceptCode);
-await page.getByText("Verify and sign in").click();
-await page.waitForTimeout(3000);
-check("the right code signs in", /Good (Morning|Afternoon|Evening)/.test(await bodyText()), (await bodyText()).slice(0, 140));
+await page.reload({ waitUntil: "networkidle" });
+await page.waitForTimeout(2000);
+check("it survives a reload", /Good (Morning|Afternoon|Evening),\s*Dana\./i.test(await bodyText()));
+check("a guest name never leaves the device", writes.every((w) => w.display_name !== "Dana"));
 
 check("no page errors", errors.length === 0, errors.join(" | "));
 

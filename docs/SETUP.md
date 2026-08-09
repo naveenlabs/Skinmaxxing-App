@@ -163,27 +163,15 @@ and posting directly to the API.
 
 ## 5. Auth settings (dashboard, not SQL)
 
-**Authentication → Providers → Email**
-- One-time password (OTP) enabled
-- **OTP expiry: 600 seconds.** The default is an hour, which is a long time for a
-  six-digit code to stay valid.
-- Max OTP verification attempts: leave at the default (Supabase enforces this
-  server-side; the app's own attempt cap is only there to give a clearer message).
+**Google is the only way in.** The email six-digit-code door was removed from the app.
 
-**Authentication → Rate limits**
-- Emails per hour: match whatever the SMTP provider allows.
-- Token verifications per hour: leave at the default unless it proves too tight.
+**Authentication → Providers → Email — turn it off.** Removing the button removed it from
+the *interface*; the provider itself stays live at the API until it's disabled here, so
+anyone who knows the project URL could still request a code and get a session. Turning it
+off is what actually closes the door. No SMTP is needed, and nothing else has to change.
 
-**Authentication → SMTP** — required for email codes to work at all. Supabase's built-in
-sender is capped at **2 emails per hour across the whole project** and is explicitly not
-for production. Resend's free tier (3,000/month) is enough:
-
-1. resend.com → create an account
-2. Use `onboarding@resend.dev` as the sender, or verify a domain
-3. Copy the SMTP credentials into Supabase → Authentication → SMTP Settings
-
-Until this is done, "Email me a code instead" will fail after the first two attempts in
-any hour. Google sign-in is unaffected.
+**Authentication → Rate limits** — defaults are fine. With email disabled the only limit
+that matters is token refreshes.
 
 **Authentication → URL Configuration**
 - Site URL: `https://skinmaxxing.netlify.app`

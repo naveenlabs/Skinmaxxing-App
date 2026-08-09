@@ -249,72 +249,6 @@ export function useAuth() {
     if (e) setError(e.message || "Couldn't reach Google. Check your connection and try again.");
   }, []);
 
-  /*
-    Email code sign-in. Supabase's own OTP is used rather than anything hand-rolled: the
-    code is generated, stored and verified server-side, so `verifyOtp` succeeding is real
-    proof of email ownership. A client-side OTP would be theatre.
-
-    Account enumeration: `shouldCreateUser: true` means requesting a code behaves
-    identically whether or not the address already has an account — nothing in the
-    response or the UI distinguishes the two. Whether the account already holds a routine
-    is only ever revealed *after* verification, at which point ownership is proven.
-
-    Expiry, send-rate and maximum verification attempts are enforced by Supabase (see the
-    Auth settings noted in docs/SETUP.md). The cooldown below is UX, not the control.
-  */
-  const sendCode = useCallback(async (email) => {
-    if (!isSupabaseConfigured) return { ok: false, error: "Sign-in isn't configured on this build." };
-    const address = String(email || "").trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
-      return { ok: false, error: "That doesn't look like an email address." };
-    }
-    try {
-      const { error: e } = await supabase.auth.signInWithOtp({
-        email: address,
-        options: { shouldCreateUser: true },
-      });
-      if (e) {
-        const msg = e.message || "";
-        if (/rate|too many|limit/i.test(msg)) {
-          return { ok: false, error: "Too many codes requested. Wait a minute and try again." };
-        }
-        if (/fetch|network/i.test(msg) || !isOnline()) {
-          return { ok: false, error: "Couldn't reach the server. Check your connection." };
-        }
-        // Anything else is reported generically so nothing distinguishes a known
-        // address from an unknown one.
-        console.warn("[glass] sendCode:", msg);
-        return { ok: false, error: "Couldn't send a code just now. Try again in a moment." };
-      }
-      return { ok: true, email: address };
-    } catch {
-      return { ok: false, error: "Couldn't reach the server. Check your connection." };
-    }
-  }, []);
-
-  const verifyCode = useCallback(async (email, code) => {
-    if (!isSupabaseConfigured) return { ok: false, error: "Sign-in isn't configured on this build." };
-    const token = String(code || "").replace(/\D/g, "");
-    if (token.length < 6) return { ok: false, error: "Enter the 6-digit code from your email." };
-    try {
-      const { data, error: e } = await supabase.auth.verifyOtp({
-        email: String(email).trim().toLowerCase(), token, type: "email",
-      });
-      if (e) {
-        const msg = e.message || "";
-        if (/expire/i.test(msg)) return { ok: false, error: "That code has expired — send a new one." };
-        if (/rate|too many|limit/i.test(msg)) {
-          return { ok: false, error: "Too many attempts. Request a new code." };
-        }
-        return { ok: false, error: "That code isn't right. Check it and try again." };
-      }
-      if (!data?.session) return { ok: false, error: "That code isn't right. Check it and try again." };
-      return { ok: true };
-    } catch {
-      return { ok: false, error: "Couldn't reach the server. Check your connection." };
-    }
-  }, []);
-
   const signOut = useCallback(async () => {
     writeDeviceFlag(AUTH_MODE_KEY, null);
     namespacedFor.current = undefined;
@@ -354,8 +288,6 @@ export function useAuth() {
     setError,
     clearError: useCallback(() => setError(null), []),
     signInWithGoogle,
-    sendCode,
-    verifyCode,
     signOut,
     continueAsGuest,
     exitGuest,
