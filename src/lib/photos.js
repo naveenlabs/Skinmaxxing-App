@@ -7,12 +7,13 @@ import { loadJSON, saveJSON, getStore, approxBytes } from "./store.js";
   Supabase Storage while everything else syncs through user_state.
 
   The device still writes every photo locally first — that's what makes capture feel
-  instant and keeps Journey working on a plane. The upload is queued behind it and
-  retried on the next boot or the next time the network returns, so closing the app
-  mid-upload costs nothing.
+  instant and keeps Journey working on a plane. Uploads AND deletes are queued behind it
+  and retried on the next boot or reconnect, so closing the app mid-operation costs
+  nothing and a delete made offline doesn't leave an orphan in the bucket forever.
 */
 
 const QUEUE_KEY = "nv-photo-pending";
+const DELETE_QUEUE_KEY = "nv-photo-deletes";
 const ATIME_KEY = "nv-photo-atime";
 
 export function photoPath(uid, date, period, id) {
@@ -65,23 +66,36 @@ export function pickEvictions(sizes, atimes, budgetBytes, keep = new Set()) {
   return drop;
 }
 
-export function usePhotoSync({ enabled, userId }) {
+export function usePhotoSync({ enabled, userId, identityKey }) {
   const queueRef = useRef({});
-  const flushing = useRef(false);
+  const deleteQueueRef = useRef([]);
   const atimeRef = useRef({});
-  const loadedFor = useRef(null);
+  const flushing = useRef(false);
+  const epochRef = useRef(identityKey);
+  epochRef.current = identityKey;
 
   useEffect(() => {
     let alive = true;
+    // Reset before loading: these queues belong to one identity's namespace.
+    queueRef.current = {};
+    deleteQueueRef.current = [];
+    atimeRef.current = {};
+    if (!identityKey) return undefined;
+
     (async () => {
-      const [q, a] = await Promise.all([loadJSON(QUEUE_KEY, {}), loadJSON(ATIME_KEY, {})]);
-      if (!alive) return;
-      queueRef.current = q && typeof q === "object" ? q : {};
-      atimeRef.current = a && typeof a === "object" ? a : {};
-      loadedFor.current = userId || "guest";
+      const [q, d, a] = await Promise.all([
+        loadJSON(QUEUE_KEY, {}), loadJSON(DELETE_QUEUE_KEY, []), loadJSON(ATIME_KEY, {}),
+      ]);
+      if (!alive || epochRef.current !== identityKey) return;
+      // Merge rather than replace: a photo saved while this read was in flight has
+      // already put itself in the queue, and overwriting would drop it silently — with
+      // the backfill flag set, nothing would ever rescan it.
+      queueRef.current = { ...(q && typeof q === "object" ? q : {}), ...queueRef.current };
+      deleteQueueRef.current = [...(Array.isArray(d) ? d : []), ...deleteQueueRef.current];
+      atimeRef.current = { ...(a && typeof a === "object" ? a : {}), ...atimeRef.current };
     })();
     return () => { alive = false; };
-  }, [userId]);
+  }, [identityKey]);
 
   const touch = useCallback((key) => {
     atimeRef.current = { ...atimeRef.current, [key]: Date.now() };
@@ -91,14 +105,28 @@ export function usePhotoSync({ enabled, userId }) {
   const flush = useCallback(async () => {
     if (!enabled || !userId || !supabase) return;
     if (flushing.current) return;
-    const pending = Object.keys(queueRef.current);
-    if (!pending.length) return;
     if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    const epoch = identityKey;
 
     flushing.current = true;
     try {
+      // Deletes first: they free quota and can't be undone by a later upload.
+      const pendingDeletes = [...deleteQueueRef.current];
+      if (pendingDeletes.length) {
+        try {
+          const { error } = await supabase.storage.from(PHOTO_BUCKET).remove(pendingDeletes);
+          if (error) throw error;
+          if (epochRef.current !== epoch) return;
+          deleteQueueRef.current = deleteQueueRef.current.filter((p) => !pendingDeletes.includes(p));
+          await saveJSON(DELETE_QUEUE_KEY, deleteQueueRef.current);
+        } catch (e) {
+          console.warn("[glass] photo delete deferred:", e?.message || e);
+        }
+      }
+
       const store = getStore();
-      for (const key of pending) {
+      for (const key of Object.keys(queueRef.current)) {
+        if (epochRef.current !== epoch) return;
         const [date, period, id] = key.split(":");
         try {
           const r = store ? await store.get(localPhotoKey(date, period, id)) : null;
@@ -116,14 +144,14 @@ export function usePhotoSync({ enabled, userId }) {
           break;
         }
       }
-      await saveJSON(QUEUE_KEY, queueRef.current);
+      if (epochRef.current === epoch) await saveJSON(QUEUE_KEY, queueRef.current);
     } finally {
       flushing.current = false;
     }
-  }, [enabled, userId]);
+  }, [enabled, userId, identityKey]);
 
   useEffect(() => {
-    if (!enabled || !userId) return;
+    if (!enabled || !userId) return undefined;
     const t = setTimeout(flush, 1500);
     const onOnline = () => flush();
     window.addEventListener("online", onOnline);
@@ -150,40 +178,60 @@ export function usePhotoSync({ enabled, userId }) {
 
   const removeRemote = useCallback(async (list) => {
     if (!enabled || !userId || !supabase || !list.length) return;
-    let changed = false;
+    let queueChanged = false;
     list.forEach(({ date, period, id }) => {
       const k = `${date}:${period}:${id}`;
-      if (queueRef.current[k]) { delete queueRef.current[k]; changed = true; }
+      if (queueRef.current[k]) { delete queueRef.current[k]; queueChanged = true; }
     });
-    if (changed) await saveJSON(QUEUE_KEY, queueRef.current);
+    if (queueChanged) await saveJSON(QUEUE_KEY, queueRef.current);
+
+    const paths = list.map(({ date, period, id }) => photoPath(userId, date, period, id));
     try {
-      await supabase.storage.from(PHOTO_BUCKET)
-        .remove(list.map(({ date, period, id }) => photoPath(userId, date, period, id)));
-    } catch (e) { console.warn("[glass] remote photo delete failed:", e?.message || e); }
+      const { error } = await supabase.storage.from(PHOTO_BUCKET).remove(paths);
+      if (error) throw error;
+    } catch (e) {
+      // Queue it. Previously this was a bare console.warn, so a photo deleted offline
+      // stayed in the bucket forever with nothing left pointing at it.
+      console.warn("[glass] remote photo delete deferred:", e?.message || e);
+      deleteQueueRef.current = [...new Set([...deleteQueueRef.current, ...paths])];
+      await saveJSON(DELETE_QUEUE_KEY, deleteQueueRef.current);
+    }
   }, [enabled, userId]);
 
+  /** Throws on failure so "Delete everything" can abort before wiping local. */
   const removeAllRemote = useCallback(async () => {
     if (!enabled || !userId || !supabase) return;
-    queueRef.current = {};
-    await saveJSON(QUEUE_KEY, {});
-    try {
-      // Storage has no recursive delete, so walk the user's folder a level at a time.
-      const paths = [];
-      const { data: dates } = await supabase.storage.from(PHOTO_BUCKET).list(userId, { limit: 1000 });
-      for (const d of dates || []) {
+    const paths = [];
+    let offset = 0;
+    // Storage has no recursive delete, so walk the user's folder a level at a time.
+    for (;;) {
+      const { data: dates, error } = await supabase.storage
+        .from(PHOTO_BUCKET).list(userId, { limit: 100, offset });
+      if (error) throw error;
+      if (!dates || !dates.length) break;
+      for (const d of dates) {
         for (const period of ["am", "pm"]) {
-          const { data: files } = await supabase.storage
+          const { data: files, error: e2 } = await supabase.storage
             .from(PHOTO_BUCKET).list(`${userId}/${d.name}/${period}`, { limit: 1000 });
+          if (e2) throw e2;
           (files || []).forEach((f) => paths.push(`${userId}/${d.name}/${period}/${f.name}`));
         }
       }
-      for (let i = 0; i < paths.length; i += 100) {
-        await supabase.storage.from(PHOTO_BUCKET).remove(paths.slice(i, i + 100));
-      }
-    } catch (e) { console.warn("[glass] bulk photo delete failed:", e?.message || e); }
+      if (dates.length < 100) break;
+      offset += dates.length;
+    }
+    for (let i = 0; i < paths.length; i += 100) {
+      const { error } = await supabase.storage.from(PHOTO_BUCKET).remove(paths.slice(i, i + 100));
+      if (error) throw error;
+    }
+    queueRef.current = {};
+    deleteQueueRef.current = [];
+    await Promise.all([saveJSON(QUEUE_KEY, {}), saveJSON(DELETE_QUEUE_KEY, [])]);
   }, [enabled, userId]);
 
-  const pendingCount = useCallback(() => Object.keys(queueRef.current).length, []);
+  const pendingCount = useCallback(
+    () => Object.keys(queueRef.current).length + deleteQueueRef.current.length, []
+  );
 
   return { queueUpload, fetchRemote, removeRemote, removeAllRemote, touch, atimes: atimeRef, pendingCount, flush };
 }

@@ -79,6 +79,84 @@ function sameEntry(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/* ---------------------------- field-level merging ---------------------------- */
+/*
+  `logs` and `photoIndex` are keyed by date, so a whole-entry last-write-wins would let
+  one device's evening overwrite another device's morning: tick AM on the phone at 08:00,
+  tick PM on the iPad at 22:00 without the phone syncing in between, and the iPad's
+  newer day stamp replaces the entire day — the morning's ticks, mood and note vanish.
+
+  So these two kinds stamp *per field within the day*, and a day's stamp is an object
+  rather than a number. A stamp that is still a plain number (written by an older build,
+  or by a device that hasn't updated) is read as a uniform stamp across every field, so
+  old and new meta interoperate without a migration.
+*/
+
+// Fields that are maps of productId -> bool. Union the ids; unticking writes an explicit
+// `false` rather than removing the key, so a union never resurrects a cleared tick.
+const LOG_MAP_FIELDS = new Set(["am", "pm"]);
+
+const FIELDED_KINDS = new Set(["logs", "photoIndex"]);
+
+function fieldStamp(stampForKey, field) {
+  if (typeof stampForKey === "number") return stampForKey;
+  if (stampForKey && typeof stampForKey === "object") return stampForKey[field] || 0;
+  return 0;
+}
+
+function maxStamp(stampForKey) {
+  if (typeof stampForKey === "number") return stampForKey;
+  if (stampForKey && typeof stampForKey === "object") {
+    return Object.values(stampForKey).reduce((a, b) => Math.max(a, Number(b) || 0), 0);
+  }
+  return 0;
+}
+
+function stampFields(prevEntry, nextEntry, existing, now) {
+  const out = typeof existing === "object" && existing !== null ? { ...existing } : {};
+  // A numeric stamp means "everything changed at this time" — expand it before refining.
+  if (typeof existing === "number") {
+    Object.keys(nextEntry || {}).forEach((f) => { out[f] = existing; });
+  }
+  const fields = new Set([...Object.keys(prevEntry || {}), ...Object.keys(nextEntry || {})]);
+  fields.forEach((f) => {
+    if (!sameEntry(prevEntry?.[f], nextEntry?.[f])) out[f] = now;
+  });
+  return out;
+}
+
+function mergeFields(localEntry, remoteEntry, localStamp, remoteStamp) {
+  const merged = {};
+  const stamp = {};
+  const fields = new Set([...Object.keys(localEntry || {}), ...Object.keys(remoteEntry || {})]);
+
+  fields.forEach((f) => {
+    const lTs = fieldStamp(localStamp, f);
+    const rTs = fieldStamp(remoteStamp, f);
+    const hasLocal = localEntry && f in localEntry;
+    const hasRemote = remoteEntry && f in remoteEntry;
+
+    if (hasLocal && hasRemote && LOG_MAP_FIELDS.has(f)
+        && typeof localEntry[f] === "object" && typeof remoteEntry[f] === "object"
+        && !Array.isArray(localEntry[f])) {
+      // Both sides ticked things in the same period: keep every id, and let the newer
+      // stamp settle only the ids they disagree about.
+      const older = rTs > lTs ? localEntry[f] : remoteEntry[f];
+      const newer = rTs > lTs ? remoteEntry[f] : localEntry[f];
+      merged[f] = { ...older, ...newer };
+    } else if (hasLocal && hasRemote) {
+      merged[f] = rTs > lTs ? remoteEntry[f] : localEntry[f];
+    } else {
+      merged[f] = hasLocal ? localEntry[f] : remoteEntry[f];
+    }
+
+    const best = Math.max(lTs, rTs);
+    if (best) stamp[f] = best;
+  });
+
+  return { entry: merged, stamp };
+}
+
 /**
  * Compare what's about to be written against the previous snapshot and stamp only
  * the entries that actually moved. Returns a new meta — never mutates its argument.
@@ -88,9 +166,13 @@ export function stampChanges(kind, prevDoc, nextDoc, meta, now = Date.now()) {
   const prev = toEntries(kind, prevDoc);
   const next = toEntries(kind, nextDoc);
 
+  const fielded = FIELDED_KINDS.has(kind);
+
   Object.keys(next).forEach((key) => {
     if (!sameEntry(prev[key], next[key])) {
-      m[kind][key] = now;
+      m[kind][key] = fielded
+        ? stampFields(prev[key], next[key], m[kind][key], now)
+        : now;
       delete m.deleted[kind][key];
     }
   });
@@ -127,9 +209,13 @@ export function mergeDoc(kind, localDoc, localMeta, remoteDoc, remoteMeta) {
   const merged = {};
   const meta = emptyMeta();
 
+  const fielded = FIELDED_KINDS.has(kind);
+
   keys.forEach((key) => {
-    const lTs = lm[kind][key] || 0;
-    const rTs = rm[kind][key] || 0;
+    const lStamp = lm[kind][key];
+    const rStamp = rm[kind][key];
+    const lTs = maxStamp(lStamp);
+    const rTs = maxStamp(rStamp);
     const newestWrite = Math.max(lTs, rTs);
     const newestDelete = Math.max(lm.deleted[kind][key] || 0, rm.deleted[kind][key] || 0);
     const hasLocal = key in local;
@@ -140,10 +226,23 @@ export function mergeDoc(kind, localDoc, localMeta, remoteDoc, remoteMeta) {
       return;
     }
 
+    // Field merging only makes sense for two plain objects. Anything else (a malformed
+    // entry, a value from a future shape) falls back to whole-entry last-write-wins
+    // rather than being flattened into an empty object.
+    const isPlain = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+    if (fielded && hasLocal && hasRemote && isPlain(local[key]) && isPlain(remote[key])) {
+      // Per-field so one device's evening can't erase another's morning.
+      const { entry, stamp } = mergeFields(local[key], remote[key], lStamp, rStamp);
+      merged[key] = entry;
+      if (Object.keys(stamp).length) meta[kind][key] = stamp;
+      return;
+    }
+
     if (hasLocal && hasRemote) merged[key] = rTs > lTs ? remote[key] : local[key];
     else merged[key] = hasLocal ? local[key] : remote[key];
 
-    if (newestWrite) meta[kind][key] = newestWrite;
+    const surviving = hasLocal && !hasRemote ? lStamp : (!hasLocal && hasRemote ? rStamp : (rTs > lTs ? rStamp : lStamp));
+    if (newestWrite) meta[kind][key] = fielded ? surviving : newestWrite;
   });
 
   // Local order first so the device in hand keeps its arrangement; anything only the

@@ -340,12 +340,24 @@ export default function App() {
   const userId = auth.user?.id || null;
   const [accountOpen, setAccountOpen] = useState(false);
 
+  // Which store everything belongs to. Null until auth settles, because useAuth sets the
+  // storage namespace before it reports a status — reading first would load the signed-out
+  // store into a signed-in session. Signing in or out changes this key, and EVERY piece of
+  // state below is re-derived from it.
+  const identityKey = auth.status === "loading" ? null : (userId || "guest");
+  const identityKeyRef = useRef(identityKey);
+  identityKeyRef.current = identityKey;
+
   // Ref mirrors so the sync engine always reads the current documents without being
   // re-created on every keystroke.
   const docsRef = useRef({});
   docsRef.current = { products, logs, photoIndex };
-  const readyRef = useRef(false);
-  readyRef.current = ready;
+
+  // Holds the identity whose boot read actually completed — not a bare boolean. A boolean
+  // stayed true across a sign-out, which let the sync engine start pushing while React
+  // still held the *previous* account's documents: that is how account A's routine ended
+  // up in account B's row. Sync refuses to run unless this equals the current identity.
+  const readyForRef = useRef(null);
 
   // Writes merged remote data down WITHOUT stamping it as a local change — stamping it
   // would mark it dirty and push it straight back up, forever.
@@ -355,71 +367,96 @@ export default function App() {
     if (pi) { photoIndexRef.current = pi; setPhotoIndex(pi); await saveJSON("nv-photo-index", pi); }
   }, []);
 
-  const sync = useSync({ enabled: cloudEnabled, userId, docsRef, readyRef, applyRemote });
+  const sync = useSync({ enabled: cloudEnabled, userId, identityKey, docsRef, readyForRef, applyRemote });
   const { recordChange, displayName, setDisplayName } = sync;
-  const photoSync = usePhotoSync({ enabled: cloudEnabled, userId });
+  const photoSync = usePhotoSync({ enabled: cloudEnabled, userId, identityKey });
   const { queueUpload, fetchRemote, removeRemote, removeAllRemote, touch: touchPhoto } = photoSync;
 
-  // Which store the boot read should come from. Null until auth settles, because
-  // useAuth sets the storage namespace before it reports a status — reading first
-  // would load the signed-out store into a signed-in session. Signing in or out
-  // changes this key, which re-reads from the namespace that now applies.
-  const identityKey = auth.status === "loading" ? null : (userId || "guest");
-
   useEffect(() => {
-    if (!identityKey) return;
-    (async () => {
-      const [p, l, legacyDates, newIndex, sizes] = await Promise.all([
-        loadJSON("nv-products", null),
-        loadJSON("nv-logs", {}),
-        loadJSON("nv-photo-dates", []),
-        loadJSON("nv-photo-index", null),
-        loadJSON("nv-photo-sizes", {}),
-      ]);
-      const loadedLogs = l || {};
-      if (p && p.length) {
-        // upgrade the old single-status shape to a dated timeline, once
-        const { products: withStints, changed } = migrateProductStints(p, loadedLogs);
-        setProducts(withStints);
-        if (changed) persistJSON("nv-products", withStints);
-      } else {
-        // a genuinely fresh install starts with an empty shelf — nothing appears until
-        // the user adds it themselves
-        setProducts([]);
-        persistJSON("nv-products", []);
-      }
-      setLogs(loadedLogs);
+    if (!identityKey) return undefined;
+    let alive = true;
+    const epoch = identityKey;
 
-      if (newIndex) {
-        // upgrade in place if any slot is still the old boolean shape, not an array of ids
-        let needsMigration = false;
-        const migrated = {};
-        Object.keys(newIndex).forEach((d) => {
-          const slot = newIndex[d] || {};
-          const upgrade = (v) => {
-            if (Array.isArray(v)) return v;
-            needsMigration = true;
-            if (v === true) return ["__single__"];
-            if (v === "legacy") return ["__legacy__"];
-            return [];
-          };
-          migrated[d] = { am: upgrade(slot.am), pm: upgrade(slot.pm) };
-        });
-        photoIndexRef.current = migrated;
-        setPhotoIndex(migrated);
-        if (needsMigration) persistJSON("nv-photo-index", migrated);
-      } else if (legacyDates && legacyDates.length) {
-        // oldest scheme: one photo/day under `photo:${date}`, no period distinction
-        const migrated = {};
-        legacyDates.forEach((d) => { migrated[d] = { am: ["__legacy__"], pm: [] }; });
-        photoIndexRef.current = migrated;
-        setPhotoIndex(migrated);
-        persistJSON("nv-photo-index", migrated);
+    // Nothing from the previous identity may survive into this one — not the documents,
+    // not the decoded photo cache, not the size table. `ready` drops so the boot screen
+    // covers the swap and no view renders another account's data for a frame.
+    setReady(false);
+    readyForRef.current = null;
+    setProducts([]);
+    setLogs({});
+    setPhotoIndex({});
+    photoIndexRef.current = {};
+    setPhotoSizes({});
+    photoSizesRef.current = {};
+    setPhotoCache({});
+    setSelectedDate(todayStr());
+
+    (async () => {
+      try {
+        const [p, l, legacyDates, newIndex, sizes] = await Promise.all([
+          loadJSON("nv-products", null),
+          loadJSON("nv-logs", {}),
+          loadJSON("nv-photo-dates", []),
+          loadJSON("nv-photo-index", null),
+          loadJSON("nv-photo-sizes", {}),
+        ]);
+        // The namespace may have moved on while those were in flight; a late write here
+        // would land in the wrong account's store.
+        if (!alive || identityKeyRef.current !== epoch) return;
+
+        const loadedLogs = l || {};
+        if (p && p.length) {
+          // upgrade the old single-status shape to a dated timeline, once
+          const { products: withStints, changed } = migrateProductStints(p, loadedLogs);
+          setProducts(withStints);
+          if (changed) persistJSON("nv-products", withStints);
+        } else {
+          // a genuinely fresh install starts with an empty shelf — nothing appears until
+          // the user adds it themselves
+          setProducts(p || []);
+        }
+        setLogs(loadedLogs);
+
+        if (newIndex) {
+          // upgrade in place if any slot is still the old boolean shape, not an array of ids
+          let needsMigration = false;
+          const migrated = {};
+          Object.keys(newIndex).forEach((d) => {
+            const slot = newIndex[d] || {};
+            const upgrade = (v) => {
+              if (Array.isArray(v)) return v;
+              needsMigration = true;
+              if (v === true) return ["__single__"];
+              if (v === "legacy") return ["__legacy__"];
+              return [];
+            };
+            migrated[d] = { am: upgrade(slot.am), pm: upgrade(slot.pm) };
+          });
+          photoIndexRef.current = migrated;
+          setPhotoIndex(migrated);
+          if (needsMigration) persistJSON("nv-photo-index", migrated);
+        } else if (legacyDates && legacyDates.length) {
+          // oldest scheme: one photo/day under `photo:${date}`, no period distinction
+          const migrated = {};
+          legacyDates.forEach((d) => { migrated[d] = { am: ["__legacy__"], pm: [] }; });
+          photoIndexRef.current = migrated;
+          setPhotoIndex(migrated);
+          persistJSON("nv-photo-index", migrated);
+        }
+        photoSizesRef.current = sizes || {};
+        setPhotoSizes(sizes || {});
+      } catch (e) {
+        // A corrupt store must not strand the app on the boot screen forever.
+        console.warn("[glass] boot read failed:", e?.message || e);
+      } finally {
+        if (alive && identityKeyRef.current === epoch) {
+          readyForRef.current = epoch;
+          setReady(true);
+        }
       }
-      photoSizesRef.current = sizes || {};
-      setPhotoSizes(sizes || {});
-      setReady(true);
     })();
+
+    return () => { alive = false; };
   }, [identityKey]);
 
   // recordChange diffs the outgoing value against what's currently in memory and stamps
@@ -746,22 +783,25 @@ export default function App() {
   // upload queue so nothing that predates the account is left behind. Once flushed the
   // flag stops it ever running twice.
   useEffect(() => {
-    if (!cloudEnabled || !ready) return;
+    // readyForRef, not `ready`: this must not run against another identity's photo index.
+    if (!cloudEnabled || !identityKey || readyForRef.current !== identityKey) return undefined;
     let alive = true;
+    const epoch = identityKey;
     (async () => {
       if (await loadJSON("nv-photos-backfilled", false)) return;
+      if (!alive || identityKeyRef.current !== epoch) return;
       Object.entries(photoIndexRef.current).forEach(([date, slot]) => {
         ["am", "pm"].forEach((period) => (slot?.[period] || []).forEach((id) => queueUpload(date, period, id)));
       });
-      if (alive) await saveJSON("nv-photos-backfilled", true);
+      if (alive && identityKeyRef.current === epoch) await saveJSON("nv-photos-backfilled", true);
     })();
     return () => { alive = false; };
-  }, [cloudEnabled, ready, queueUpload]);
+  }, [cloudEnabled, ready, identityKey, queueUpload]);
 
   // Signed in, the cloud holds the durable copy, so the local budget becomes a cache:
   // evict the least recently viewed photos instead of refusing to save new ones.
   useEffect(() => {
-    if (!cloudEnabled || !ready) return;
+    if (!cloudEnabled || !identityKey || readyForRef.current !== identityKey) return;
     if (quotaPct <= 80) return;
     const budget = TOTAL_QUOTA_MB * 1024 * 1024 * 0.7 - dataBytesUsed;
     const keep = new Set(
@@ -805,7 +845,13 @@ export default function App() {
     );
   }
 
-  if (auth.status === "loading" || !ready) {
+  // Computed during render, not from an effect. The reset in the boot effect runs *after*
+  // React has already painted, so on the first render following an identity change the
+  // documents in state still belong to the previous account — one frame of someone else's
+  // shelf. Comparing the ref here means that frame renders the boot screen instead.
+  const readyForIdentity = ready && readyForRef.current === identityKey;
+
+  if (auth.status === "loading" || !readyForIdentity) {
     return (
       <Shell>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: 18 }}>
@@ -992,12 +1038,30 @@ export default function App() {
             onClose={() => setAccountOpen(false)}
             onSignIn={auth.signInWithGoogle}
             onSignOut={async () => { setAccountOpen(false); await auth.signOut(); }}
+            // Remote first, and abort if it fails. The other order wiped local, reloaded,
+            // then let the next pull download everything the user had just deleted back
+            // onto the phone — a destructive action that silently undid itself.
             onDeleteEverything={async () => {
-              await removeAllRemote();
-              await sync.deleteRemote();
-              await clearNamespace(userId);
+              if (cloudEnabled) {
+                try {
+                  await removeAllRemote();
+                  await sync.deleteRemote();
+                } catch (e) {
+                  console.warn("[glass] remote wipe failed:", e?.message || e);
+                  return { ok: false, error: "Couldn't reach your account. Nothing was deleted — check your connection and try again." };
+                }
+              }
+              // Photo blobs can't be enumerated through the artifact API, so hand over the
+              // keys derived from the index before it's destroyed.
+              const photoKeys = [];
+              Object.entries(photoIndexRef.current || {}).forEach(([date, slot]) => {
+                ["am", "pm"].forEach((period) => (slot?.[period] || [])
+                  .forEach((id) => photoKeys.push(storageKeyFor(date, period, id))));
+              });
+              await clearNamespace(userId, photoKeys);
               setAccountOpen(false);
               window.location.reload();
+              return { ok: true };
             }}
           />
         )}
@@ -5583,6 +5647,8 @@ function AccountView({
   const [showExport, setShowExport] = useState(false);
   const [showName, setShowName] = useState(false);
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [wiping, setWiping] = useState(false);
+  const [wipeError, setWipeError] = useState(null);
   const [avatarBroken, setAvatarBroken] = useState(false);
 
   const stats = useMemo(() => {
@@ -5757,12 +5823,20 @@ function AccountView({
         {confirmWipe && (
           <ConfirmModal
             title="Delete everything?"
-            body={isGuest
+            body={wipeError || (isGuest
               ? "Every product, logged day and progress photo on this phone will be permanently removed."
-              : "Every product, logged day and progress photo will be permanently removed from this phone and from your account."}
-            confirmLabel="Delete it all"
-            onCancel={() => setConfirmWipe(false)}
-            onConfirm={onDeleteEverything}
+              : "Every product, logged day and progress photo will be permanently removed from this phone and from your account.")}
+            confirmLabel={wiping ? "Deleting…" : "Delete it all"}
+            onCancel={() => { setConfirmWipe(false); setWipeError(null); }}
+            onConfirm={async () => {
+              if (wiping) return;
+              setWiping(true);
+              setWipeError(null);
+              const r = await onDeleteEverything();
+              // A failed remote wipe leaves everything intact on purpose — say so rather
+              // than reporting success and letting the next sync restore it all.
+              if (r && r.ok === false) { setWipeError(r.error); setWiping(false); }
+            }}
           />
         )}
       </AnimatePresence>

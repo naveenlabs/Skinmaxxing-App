@@ -32,3 +32,10 @@ export const supabase = isSupabaseConfigured
   : null;
 
 export const PHOTO_BUCKET = "progress-photos";
+
+// Dev-only test seam. Account switching is the one path that has to be exercised WITHOUT
+// a reload — a reload clears React state and would hide the exact bug the identity-check
+// audit exists to catch. Stripped from production builds by the DEV guard.
+if (import.meta.env.DEV && typeof window !== "undefined" && supabase) {
+  window.__glassSupabase = supabase;
+}

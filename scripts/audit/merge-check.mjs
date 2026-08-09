@@ -108,6 +108,67 @@ console.log("\nproduct ordering");
   check("local order wins, remote-only appended", r.products.map((p) => p.id), ["b", "a", "c"]);
 }
 
+console.log("\nfield-level day merging");
+{
+  // The real scenario: tick AM on the phone in the morning, PM on the iPad at night,
+  // neither having synced in between. A whole-day last-write-wins loses the morning.
+  const day = "2026-08-03";
+  const phone = bundle([], { [day]: { am: { p1: true }, pm: {}, amNote: "glowy" } }, {},
+    { ...emptyMeta(), logs: { [day]: { am: T1, amNote: T1 } } });
+  const ipad = bundle([], { [day]: { am: {}, pm: { p3: true }, pmNote: "tret" } }, {},
+    { ...emptyMeta(), logs: { [day]: { pm: T2, pmNote: T2 } } });
+  const r = mergeState(phone, ipad);
+  check("morning ticks survive the evening sync", r.logs[day].am, { p1: true });
+  check("evening ticks survive too", r.logs[day].pm, { p3: true });
+  check("morning note kept", r.logs[day].amNote, "glowy");
+  check("evening note kept", r.logs[day].pmNote, "tret");
+}
+{
+  const day = "d1";
+  const a = bundle([], { [day]: { amNote: "older" } }, {}, { ...emptyMeta(), logs: { [day]: { amNote: T1 } } });
+  const b = bundle([], { [day]: { amNote: "newer" } }, {}, { ...emptyMeta(), logs: { [day]: { amNote: T2 } } });
+  check("same field: newer wins", mergeState(a, b).logs[day].amNote, "newer");
+  check("same field reversed: newer still wins", mergeState(b, a).logs[day].amNote, "newer");
+}
+{
+  const day = "d1";
+  const a = bundle([], { [day]: { amNote: "written" } }, {}, { ...emptyMeta(), logs: { [day]: { amNote: T1 } } });
+  const b = bundle([], { [day]: { amNote: "" } }, {}, { ...emptyMeta(), logs: { [day]: { amNote: T2 } } });
+  check("clearing a note from another device sticks", mergeState(a, b).logs[day].amNote, "");
+}
+{
+  // Both devices toggled the same product in the same period — newer decides that id only.
+  const day = "d1";
+  const a = bundle([], { [day]: { am: { p1: true, p2: true } } }, {}, { ...emptyMeta(), logs: { [day]: { am: T1 } } });
+  const b = bundle([], { [day]: { am: { p1: false, p3: true } } }, {}, { ...emptyMeta(), logs: { [day]: { am: T2 } } });
+  check("id-level conflict resolves, others preserved",
+    mergeState(a, b).logs[day].am, { p1: false, p2: true, p3: true });
+}
+{
+  // Meta written by an older build is a plain number, not a per-field object.
+  const day = "d1";
+  const legacy = bundle([], { [day]: { am: { p1: true }, amNote: "old" } }, {}, { ...emptyMeta(), logs: { [day]: T1 } });
+  const fresh = bundle([], { [day]: { pm: { p3: true } } }, {}, { ...emptyMeta(), logs: { [day]: { pm: T2 } } });
+  const r = mergeState(legacy, fresh);
+  check("numeric legacy stamp interops", [r.logs[day].am, r.logs[day].pm, r.logs[day].amNote],
+    [{ p1: true }, { p3: true }, "old"]);
+}
+{
+  const day = "d1";
+  const a = bundle([], {}, { [day]: { am: ["ph1"], pm: [] } }, { ...emptyMeta(), photoIndex: { [day]: { am: T1 } } });
+  const b = bundle([], {}, { [day]: { am: [], pm: ["ph2"] } }, { ...emptyMeta(), photoIndex: { [day]: { pm: T2 } } });
+  const r = mergeState(a, b);
+  check("photo index AM/PM don't clobber each other", [r.photoIndex[day].am, r.photoIndex[day].pm],
+    [["ph1"], ["ph2"]]);
+}
+{
+  // A photo deleted on the newer device must not come back via union.
+  const day = "d1";
+  const a = bundle([], {}, { [day]: { am: ["ph1", "ph2"], pm: [] } }, { ...emptyMeta(), photoIndex: { [day]: { am: T1 } } });
+  const b = bundle([], {}, { [day]: { am: ["ph1"], pm: [] } }, { ...emptyMeta(), photoIndex: { [day]: { am: T2 } } });
+  check("deleted photo is not resurrected", mergeState(a, b).photoIndex[day].am, ["ph1"]);
+}
+
 console.log("\nmisc");
 {
   check("isEmptyState on a blank bundle", isEmptyState(bundle()), true);

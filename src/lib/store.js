@@ -12,10 +12,16 @@
 
 export const LS_PREFIX = "glass:";
 
-// Device-level, deliberately outside the namespace: which mode this browser is in and
-// who it last belonged to. Reading these must never depend on knowing the user yet.
+// Device-level, deliberately outside the namespace: which mode this browser is in, which
+// account has converted this device's guest data, and supabase's own session blob.
+// Reading these must never depend on knowing the user yet, and — critically — clearing a
+// namespace must never delete them. A guest tapping "Delete everything" used to wipe
+// `auth-mode` too and land on the sign-in wall they had explicitly opted out of.
 export const AUTH_MODE_KEY = `${LS_PREFIX}auth-mode`;
 export const LAST_UID_KEY = `${LS_PREFIX}last-uid`;
+export const SB_AUTH_KEY = `${LS_PREFIX}sb-auth`;
+
+const DEVICE_SUFFIXES = new Set(["auth-mode", "last-uid", "sb-auth"]);
 
 let namespace = "";
 let warnedFallback = false;
@@ -95,59 +101,128 @@ export function listKeys(ns = namespace) {
     if (!k || !k.startsWith(full)) continue;
     const rest = k.slice(full.length);
     // `glass:` keys of a *different* namespace also start with `glass:` when ns is "",
-    // so exclude anything that is itself namespaced.
-    if (ns === "" && /^u_[^:]+:/.test(rest)) continue;
+    // so exclude anything that is itself namespaced — and never report the device flags,
+    // which belong to the browser rather than to any one identity.
+    if (ns === "") {
+      if (/^u_[^:]+:/.test(rest)) continue;
+      if (DEVICE_SUFFIXES.has(rest)) continue;
+    }
     out.push(rest);
   }
   return out;
 }
 
+const MIGRATION_JOURNAL = `${LS_PREFIX}migration`;
+
+function readJournal() {
+  try { return JSON.parse(window.localStorage.getItem(MIGRATION_JOURNAL) || "null"); }
+  catch { return null; }
+}
+function writeJournal(v) {
+  try {
+    if (v == null) window.localStorage.removeItem(MIGRATION_JOURNAL);
+    else window.localStorage.setItem(MIGRATION_JOURNAL, JSON.stringify(v));
+  } catch { /* ignore */ }
+}
+
 /**
- * Move every key from one namespace to another, one at a time. Renaming rather than
- * copying the whole store matters: a shelf full of progress photos can be most of the
- * localStorage budget, and duplicating it wholesale would blow the quota mid-migration.
- * Peak overhead here is a single photo.
+ * Copy every key from one namespace into another, resumably.
+ *
+ * Copy, not move: the source is the user's guest data, and the previous version renamed
+ * keys out from under them *before* the UI asked what they wanted — so choosing "use my
+ * account's data" destroyed a routine they had never agreed to give up. The source is
+ * left completely intact here; deciding whether to retire it is the caller's business.
+ *
+ * A journal records which keys have landed, so an interruption (closed tab, quota, dead
+ * battery) resumes on the next attempt instead of leaving a half-applied merge with no
+ * way to tell what made it across.
+ *
+ * @returns {{copied: number, total: number, complete: boolean, error: string|null}}
  */
-export async function migrateNamespace(fromUid, toUid) {
-  if (typeof window === "undefined" || isArtifactRuntime()) return 0;
+export async function copyNamespace(fromUid, toUid, { overwrite = false } = {}) {
+  if (typeof window === "undefined" || isArtifactRuntime()) {
+    return { copied: 0, total: 0, complete: true, error: null };
+  }
   const from = nsFor(fromUid);
   const to = nsFor(toUid);
-  if (from === to) return 0;
+  if (from === to) return { copied: 0, total: 0, complete: true, error: null };
 
   const keys = listKeys(from);
-  let moved = 0;
+  const journal = readJournal();
+  const done = new Set(journal?.from === from && journal?.to === to ? journal.done || [] : []);
+
+  let copied = 0;
+  let error = null;
   for (const key of keys) {
-    const src = LS_PREFIX + from + key;
-    const dst = LS_PREFIX + to + key;
+    if (done.has(key)) { copied++; continue; }
     try {
-      const v = window.localStorage.getItem(src);
-      if (v == null) continue;
-      if (window.localStorage.getItem(dst) == null) window.localStorage.setItem(dst, v);
-      window.localStorage.removeItem(src);
-      moved++;
-    } catch {
-      // out of room mid-move: stop rather than half-delete the rest
+      const v = window.localStorage.getItem(LS_PREFIX + from + key);
+      if (v == null) { done.add(key); continue; }
+      const dst = LS_PREFIX + to + key;
+      if (overwrite || window.localStorage.getItem(dst) == null) {
+        window.localStorage.setItem(dst, v);
+      }
+      done.add(key);
+      copied++;
+      writeJournal({ from, to, done: [...done], total: keys.length });
+    } catch (e) {
+      // Out of room or storage disabled. Stop cleanly with the journal intact so the
+      // next attempt picks up exactly where this one stopped. Nothing is deleted.
+      error = e?.name === "QuotaExceededError"
+        ? "Ran out of space on this device partway through."
+        : (e?.message || "Copy failed.");
       break;
     }
   }
-  return moved;
+
+  const complete = !error && copied >= keys.length;
+  if (complete) writeJournal(null);
+  return { copied, total: keys.length, complete, error };
 }
 
-/** Wipe everything belonging to one namespace. Used by "Delete all data". */
-export async function clearNamespace(uid) {
+/** Is a guest→account copy sitting half-finished? */
+export function pendingMigration() {
+  const j = readJournal();
+  return j && j.to ? j : null;
+}
+
+/** Forget everything in one namespace once the user has confirmed it's been carried over. */
+export async function retireNamespace(uid) {
+  return clearNamespace(uid);
+}
+
+/**
+ * Wipe everything belonging to one namespace, leaving the device flags alone.
+ *
+ * @param {string|null} uid
+ * @param {string[]} extraKeys keys the caller knows about that enumeration can't reach.
+ *   The artifact API has no way to list keys, so App passes the photo keys it can derive
+ *   from the photo index. Without this, "Delete everything" left every progress photo in
+ *   storage while deleting the index that could have found them again.
+ */
+export async function clearNamespace(uid, extraKeys = []) {
   const ns = nsFor(uid);
+  const store = getStore();
+
   if (isArtifactRuntime()) {
-    const store = getStore();
     if (!store) return;
-    await Promise.all(
-      ["nv-products", "nv-logs", "nv-photo-index", "nv-photo-sizes", "nv-photo-dates", "nv-meta", "nv-profile"]
-        .map((k) => store.delete(k).catch(() => {}))
-    );
+    const known = [
+      "nv-products", "nv-logs", "nv-photo-index", "nv-photo-sizes", "nv-photo-dates",
+      "nv-meta", "nv-profile", "nv-synced-once", "nv-photos-backfilled",
+      "nv-photo-pending", "nv-photo-atime", "nv-avatar",
+    ];
+    await Promise.all([...known, ...extraKeys].map((k) => store.delete(k).catch(() => {})));
     return;
   }
+
+  // localStorage can be enumerated, so take everything under the namespace rather than
+  // trusting a hardcoded list to stay in step with the app.
   listKeys(ns).forEach((k) => {
     try { window.localStorage.removeItem(LS_PREFIX + ns + k); } catch { /* ignore */ }
   });
+  if (store) {
+    await Promise.all(extraKeys.map((k) => store.delete(k).catch(() => {})));
+  }
 }
 
 /* ------------------------------- device flags ------------------------------- */
