@@ -28,7 +28,31 @@ create table public.user_state (
 alter table public.user_state enable row level security;
 
 create policy "own row" on public.user_state
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  for all using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
+```
+
+`auth.uid()` is wrapped in a `select` so Postgres evaluates it once per query instead of
+once per row. Semantically identical, and it keeps the database linter quiet.
+
+**The `updated_at` trigger is load-bearing — don't skip it.** The client never sends
+`updated_at`; it reads the value back and passes it to the next write as a precondition
+(`.eq("updated_at", …)` in `src/lib/sync.js`). That is how a second device's edit is
+detected instead of silently overwritten. Without this trigger the column would keep its
+insert-time value forever, every conditional update would match, and concurrent edits on
+two devices would clobber each other with no conflict ever raised.
+
+```sql
+create or replace function public.touch_updated_at()
+returns trigger language plpgsql set search_path = '' as $$
+begin new.updated_at = now(); return new; end $$;
+
+drop trigger if exists user_state_touch on public.user_state;
+create trigger user_state_touch
+  before insert or update on public.user_state
+  for each row execute function public.touch_updated_at();
+
+revoke all on function public.touch_updated_at() from public, anon, authenticated;
 ```
 
 ---
@@ -41,7 +65,7 @@ any honest use while still being a real ceiling.
 
 ```sql
 create or replace function public.enforce_user_state_size()
-returns trigger language plpgsql as $$
+returns trigger language plpgsql set search_path = '' as $$
 declare
   row_bytes int;
 begin
@@ -72,11 +96,20 @@ drop trigger if exists user_state_size on public.user_state;
 create trigger user_state_size
   before insert or update on public.user_state
   for each row execute function public.enforce_user_state_size();
+
+revoke all on function public.enforce_user_state_size() from public, anon, authenticated;
 ```
 
 Note the `auth.uid()` check is deliberately redundant with RLS. Defence in depth: if a
 policy is ever loosened by accident, the trigger still refuses to write one user's data
 into another user's row.
+
+The `revoke` stops the function being callable as a REST RPC. Postgres does **not** check
+`EXECUTE` when firing a trigger, so the trigger keeps working — only the
+`/rest/v1/rpc/…` door closes. `set search_path = ''` is the matching hardening: with an
+empty search path nothing unqualified can be resolved, so a schema someone else controls
+can't shadow a call inside the function body. Both bodies here use only `pg_catalog`
+builtins and a schema-qualified `auth.uid()`, so neither change alters behaviour.
 
 ---
 
@@ -120,13 +153,59 @@ drop trigger if exists photo_quota on storage.objects;
 create trigger photo_quota
   before insert or update on storage.objects
   for each row execute function public.enforce_photo_quota();
+
+revoke all on function public.enforce_photo_quota() from public, anon, authenticated;
 ```
+
+The limit is applied **per bucket**, not across both — `progress-photos` and `avatars`
+each get their own 200 MB. That's harmless in practice: the app stores exactly one
+`avatar.jpg` per user and the bucket itself caps files at 2 MB.
+
+This one is `security definer` because it reads `storage.objects` to total up existing
+usage, which the calling user cannot do directly. That makes the `revoke` above matter
+more than it does for the others — a `security definer` function reachable over REST runs
+with the owner's privileges, so it should not be reachable over REST at all.
 
 ---
 
-## 4. Avatars bucket
+## 4. Buckets
 
-In the dashboard: **Storage → New bucket**
+Bucket names are **exact string keys**, not labels — the app looks for `progress-photos`
+and `avatars` in lowercase (`src/lib/supabase.js`). A bucket named `Avatars` or
+`Progress Photos` will not match, and Supabase has no rename, so getting this wrong means
+deleting and recreating.
+
+### 4a. Progress photos
+
+**Storage → New bucket**
+
+- Name: `progress-photos`
+- **Private** (leave "Public bucket" off)
+- Restrict file size: **5 MB**
+- Restrict MIME types: `image/jpeg`
+
+```sql
+create policy "own photos - select" on storage.objects
+  for select using (
+    bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+create policy "own photos - insert" on storage.objects
+  for insert with check (
+    bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+create policy "own photos - update" on storage.objects
+  for update using (
+    bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+create policy "own photos - delete" on storage.objects
+  for delete using (
+    bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text
+  );
+```
+
+### 4b. Avatars
+
+**Storage → New bucket**
 
 - Name: `avatars`
 - **Private** (leave "Public bucket" off)
@@ -176,6 +255,23 @@ that matters is token refreshes.
 **Authentication → URL Configuration**
 - Site URL: `https://skinmaxxing.netlify.app`
 - Redirect URLs also include `http://localhost:5173/**`
+
+**"Leaked password protection is disabled" can be ignored.** The database linter reports it
+unconditionally. It checks submitted passwords against HaveIBeenPwned — and with Google as
+the only provider this project has no passwords to check. It is the one advisor warning
+expected to stay open.
+
+---
+
+## 5b. Checking your work
+
+Supabase's own linter will confirm the above landed. In the dashboard:
+**Advisors → Security Advisor** and **Advisors → Performance Advisor**.
+
+A correctly configured project reports **no performance issues** and exactly one security
+warning — the leaked-password one noted above. Anything else means a step here was missed.
+Worth re-running after any schema change, since a new table without RLS shows up here
+first.
 
 ---
 
