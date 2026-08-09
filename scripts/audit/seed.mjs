@@ -95,6 +95,10 @@ export function buildSeed({ days = 150, today }) {
 export const seedInPage = async ({ products, logs, photoIndex, photoPlan }) => {
   const P = "glass:";
   localStorage.clear();
+  // Audits exercise the app itself, not the account gate. Without a Supabase project
+  // configured the app already boots straight into local-only mode; this keeps that
+  // true on a dev machine that does have .env.local set.
+  localStorage.setItem(P + "auth-mode", "guest");
   localStorage.setItem(P + "nv-products", JSON.stringify(products));
   localStorage.setItem(P + "nv-logs", JSON.stringify(logs));
   localStorage.setItem(P + "nv-photo-index", JSON.stringify(photoIndex));

@@ -7,9 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "verify": "npm run verify:p1 && npm run verify:p2",
+    "verify": "npm run verify:merge && npm run verify:p1 && npm run verify:p2 && npm run verify:auth",
     "verify:p1": "node scripts/audit/verify-p1.mjs /tmp/glass-verify /tmp/glass-fixtures",
     "verify:p2": "node scripts/audit/verify-p2.mjs /tmp/glass-p2",
+    "verify:merge": "node scripts/audit/merge-check.mjs",
+    "verify:auth": "node scripts/audit/auth-check.mjs /tmp/glass-auth",
+    "verify:storage": "node scripts/audit/artifact-storage.mjs",
     "fixtures": "node scripts/audit/mkfixtures.mjs /tmp/glass-fixtures",
     "shots": "node scripts/audit/snap.mjs /tmp/glass-shots",
     "shots:states": "node scripts/audit/snap-states.mjs /tmp/glass-shots"
@@ -17,6 +20,7 @@
   "dependencies": {
     "@fontsource-variable/plus-jakarta-sans": "^5.3.0",
     "@fontsource/instrument-serif": "^5.3.0",
+    "@supabase/supabase-js": "^2.112.2",
     "framer-motion": "^12.43.0",
     "lucide-react": "^0.469.0",
     "react": "^18.3.1",

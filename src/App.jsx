@@ -7,8 +7,13 @@ import {
   Layers, Search, FlaskConical, Eye, Smile, Archive, Download, MoreHorizontal, WifiOff, Trophy,
   Circle, ChartNoAxesColumn, Images, Calendar, Pencil, RotateCcw,
   ArrowDownNarrowWide, TrendingUp, TrendingDown, Info, CircleCheck,
-  CircleMinus, Undo2, CalendarClock
+  CircleMinus, Undo2, CalendarClock, LogOut, ArrowLeft, RefreshCw, Cloud, CloudUpload
 } from "lucide-react";
+
+import { useAuth } from "./lib/auth.js";
+import { useSync } from "./lib/sync.js";
+import { usePhotoSync, pickEvictions, localPhotoKey } from "./lib/photos.js";
+import { getStore, loadJSON, saveJSON, approxBytes, clearNamespace } from "./lib/store.js";
 
 /* ---------------------------------- assets ---------------------------------- */
 const HERO_IMG = new URL("./assets/hero.jpg", import.meta.url).href;
@@ -261,57 +266,18 @@ function greetingWord() {
 
 /* ------------------------------- storage layer ------------------------------ */
 
-// NOTE: this 20MB cap reflects Claude's current per-artifact storage limit.
-// Once this ships as a standalone PWA on IndexedDB, this ceiling goes up
-// dramatically (hundreds of MB+) — update TOTAL_QUOTA_MB then.
+// Signed out this is a hard ceiling on the device. Signed in the cloud holds the
+// durable copy, so it becomes a local cache budget instead and old photos are evicted
+// rather than refused — see the eviction effect in App.
 const TOTAL_QUOTA_MB = 20;
 const GALLERY_PAGE_SIZE = 20;
 const MAX_PHOTOS_PER_PICK = 5;
-function approxBytes(str) { return new Blob([str]).size; }
 function photoKey(date, period, id) { return `${date}:${period}:${id}`; }
 function genPhotoId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 
-// Storage is `window.storage` when the app runs as a Claude artifact. Outside that
-// runtime (dev server, or the standalone site build) that global doesn't exist, so
-// every read fell through to its fallback and every write threw — which surfaced as a
-// permanent "Couldn't save" banner and zero persistence. Resolve the backend per call
-// so the artifact API still wins whenever it's present, and fall back to localStorage
-// under a namespace so a standalone build actually keeps the user's data.
-const LS_PREFIX = "glass:";
-let warnedFallback = false;
-function getStore() {
-  if (typeof window === "undefined") return null;
-  if (window.storage && typeof window.storage.get === "function") return window.storage;
-  if (!warnedFallback) {
-    warnedFallback = true;
-    console.info("[glass] window.storage unavailable — using localStorage.");
-  }
-  return {
-    async get(key) {
-      const v = window.localStorage.getItem(LS_PREFIX + key);
-      return v == null ? null : { value: v };
-    },
-    async set(key, value) {
-      // a thrown QuotaExceededError here is the honest signal the save failed
-      window.localStorage.setItem(LS_PREFIX + key, value);
-      return true;
-    },
-    async delete(key) {
-      window.localStorage.removeItem(LS_PREFIX + key);
-      return true;
-    },
-  };
-}
-
-async function loadJSON(key, fallback) {
-  try {
-    const store = getStore();
-    if (!store) return fallback;
-    const r = await store.get(key);
-    if (!r || r.value == null) return fallback;
-    return JSON.parse(r.value);
-  } catch { return fallback; }
-}
+// The storage layer itself now lives in ./lib/store.js so the sync engine can sit under
+// the same seam. Behaviour is unchanged: window.storage (the Claude artifact API) still
+// wins over localStorage wherever it exists.
 /* --------------------------------- component --------------------------------- */
 
 export default function App() {
@@ -367,7 +333,41 @@ export default function App() {
     } catch { finishSave(false); }
   }, [finishSave]);
 
+  /* ------------------------------ account + sync ----------------------------- */
+
+  const auth = useAuth();
+  const cloudEnabled = auth.status === "signed-in";
+  const userId = auth.user?.id || null;
+  const [accountOpen, setAccountOpen] = useState(false);
+
+  // Ref mirrors so the sync engine always reads the current documents without being
+  // re-created on every keystroke.
+  const docsRef = useRef({});
+  docsRef.current = { products, logs, photoIndex };
+  const readyRef = useRef(false);
+  readyRef.current = ready;
+
+  // Writes merged remote data down WITHOUT stamping it as a local change — stamping it
+  // would mark it dirty and push it straight back up, forever.
+  const applyRemote = useCallback(async ({ products: p, logs: l, photoIndex: pi }) => {
+    if (p) { setProducts(p); await saveJSON("nv-products", p); }
+    if (l) { setLogs(l); await saveJSON("nv-logs", l); }
+    if (pi) { photoIndexRef.current = pi; setPhotoIndex(pi); await saveJSON("nv-photo-index", pi); }
+  }, []);
+
+  const sync = useSync({ enabled: cloudEnabled, userId, docsRef, readyRef, applyRemote });
+  const { recordChange, displayName, setDisplayName } = sync;
+  const photoSync = usePhotoSync({ enabled: cloudEnabled, userId });
+  const { queueUpload, fetchRemote, removeRemote, removeAllRemote, touch: touchPhoto } = photoSync;
+
+  // Which store the boot read should come from. Null until auth settles, because
+  // useAuth sets the storage namespace before it reports a status — reading first
+  // would load the signed-out store into a signed-in session. Signing in or out
+  // changes this key, which re-reads from the namespace that now applies.
+  const identityKey = auth.status === "loading" ? null : (userId || "guest");
+
   useEffect(() => {
+    if (!identityKey) return;
     (async () => {
       const [p, l, legacyDates, newIndex, sizes] = await Promise.all([
         loadJSON("nv-products", null),
@@ -420,10 +420,23 @@ export default function App() {
       setPhotoSizes(sizes || {});
       setReady(true);
     })();
-  }, []);
+  }, [identityKey]);
 
-  const persistProducts = useCallback((next) => { setProducts(next); persistJSON("nv-products", next); }, [persistJSON]);
-  const persistLogs = useCallback((next) => { setLogs(next); persistJSON("nv-logs", next); }, [persistJSON]);
+  // recordChange diffs the outgoing value against what's currently in memory and stamps
+  // only the entries that actually moved. Doing it here rather than at each mutation is
+  // what lets every toggle/edit/reorder function below stay exactly as it was.
+  const persistProducts = useCallback((next) => {
+    const prev = docsRef.current.products;
+    setProducts(next);
+    persistJSON("nv-products", next);
+    recordChange("products", prev, next);
+  }, [persistJSON, recordChange]);
+  const persistLogs = useCallback((next) => {
+    const prev = docsRef.current.logs;
+    setLogs(next);
+    persistJSON("nv-logs", next);
+    recordChange("logs", prev, next);
+  }, [persistJSON, recordChange]);
 
   function getDayLog(date) {
     return logs[date] || { am: {}, pm: {}, amNote: "", pmNote: "", amMood: "", pmMood: "", weeklyMood: "", weeklyNote: "" };
@@ -581,32 +594,39 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  function storageKeyFor(date, period, id) {
-    if (id === "__single__") return `photo:${date}:${period}`;
-    if (id === "__legacy__") return `photo:${date}`;
-    return `photo:${date}:${period}:${id}`;
-  }
+  const storageKeyFor = localPhotoKey;
 
   // Memoized: LazyPhoto's IntersectionObserver effect depends on this, so a new function
   // identity every render tore down and rebuilt an observer per tile on every keystroke.
   const loadPhoto = useCallback(async (date, period, id) => {
     const ck = photoKey(date, period, id);
+    touchPhoto(ck);
     if (photoCacheRef.current[ck]) return photoCacheRef.current[ck];
+
+    const adopt = (value) => {
+      setPhotoCache((c) => ({ ...c, [ck]: value }));
+      if (photoSizesRef.current[ck] == null) {
+        const next = { ...photoSizesRef.current, [ck]: approxBytes(value) };
+        photoSizesRef.current = next;
+        setPhotoSizes(next);
+        persistJSON("nv-photo-sizes", next);
+      }
+      return value;
+    };
+
     try {
       const r = await getStore().get(storageKeyFor(date, period, id));
-      if (r && r.value) {
-        setPhotoCache((c) => ({ ...c, [ck]: r.value }));
-        if (photoSizesRef.current[ck] == null) {
-          const next = { ...photoSizesRef.current, [ck]: approxBytes(r.value) };
-          photoSizesRef.current = next;
-          setPhotoSizes(next);
-          persistJSON("nv-photo-sizes", next);
-        }
-        return r.value;
-      }
-    } catch { /* nothing stored for this slot */ }
+      if (r && r.value) return adopt(r.value);
+    } catch { /* nothing stored locally for this slot */ }
+
+    // Not on this device — a new phone, or one that evicted it to stay under budget.
+    const remote = await fetchRemote(date, period, id);
+    if (remote) {
+      persistRaw(storageKeyFor(date, period, id), remote);
+      return adopt(remote);
+    }
     return null;
-  }, [persistJSON]);
+  }, [persistJSON, persistRaw, fetchRemote, touchPhoto]);
 
   // Decode + downscale a picked file WITHOUT touching stored state. Kept separate from
   // committing so a selection that turns out to be unreadable can't destroy the photos
@@ -671,6 +691,11 @@ export default function App() {
     photoIndexRef.current = nextIndex;
     setPhotoIndex(nextIndex);
     persistJSON("nv-photo-index", nextIndex);
+    recordChange("photoIndex", prev, nextIndex);
+
+    // Queued rather than awaited: capture stays instant, and an upload interrupted by a
+    // closed tab or a dead network is retried on the next boot.
+    items.forEach((it) => queueUpload(date, period, it.id));
   }
 
   async function deletePhotos(list) {
@@ -690,7 +715,8 @@ export default function App() {
     setPhotoSizes(nextSizes);
     persistJSON("nv-photo-sizes", nextSizes);
 
-    const nextIndex = { ...photoIndexRef.current };
+    const prevIndex = photoIndexRef.current;
+    const nextIndex = { ...prevIndex };
     list.forEach(({ date, period, id }) => {
       const entry = nextIndex[date] || { am: [], pm: [] };
       const nextEntry = { ...entry, [period]: (entry[period] || []).filter((x) => x !== id) };
@@ -700,6 +726,8 @@ export default function App() {
     photoIndexRef.current = nextIndex;
     setPhotoIndex(nextIndex);
     persistJSON("nv-photo-index", nextIndex);
+    recordChange("photoIndex", prevIndex, nextIndex);
+    removeRemote(list);
   }
 
   function deletePhoto(date, period, id) {
@@ -714,8 +742,70 @@ export default function App() {
   const quotaUsedMB = totalBytesUsed / (1024 * 1024);
   const quotaPct = Math.min(100, (quotaUsedMB / TOTAL_QUOTA_MB) * 100);
 
+  // First sign-in on a device that already has photos: hand the whole shelf to the
+  // upload queue so nothing that predates the account is left behind. Once flushed the
+  // flag stops it ever running twice.
+  useEffect(() => {
+    if (!cloudEnabled || !ready) return;
+    let alive = true;
+    (async () => {
+      if (await loadJSON("nv-photos-backfilled", false)) return;
+      Object.entries(photoIndexRef.current).forEach(([date, slot]) => {
+        ["am", "pm"].forEach((period) => (slot?.[period] || []).forEach((id) => queueUpload(date, period, id)));
+      });
+      if (alive) await saveJSON("nv-photos-backfilled", true);
+    })();
+    return () => { alive = false; };
+  }, [cloudEnabled, ready, queueUpload]);
 
-  if (!ready) {
+  // Signed in, the cloud holds the durable copy, so the local budget becomes a cache:
+  // evict the least recently viewed photos instead of refusing to save new ones.
+  useEffect(() => {
+    if (!cloudEnabled || !ready) return;
+    if (quotaPct <= 80) return;
+    const budget = TOTAL_QUOTA_MB * 1024 * 1024 * 0.7 - dataBytesUsed;
+    const keep = new Set(
+      ["am", "pm"].flatMap((p) => (photoIndexRef.current[selectedDate]?.[p] || [])
+        .map((id) => photoKey(selectedDate, p, id)))
+    );
+    const drop = pickEvictions(photoSizesRef.current, photoSync.atimes.current, Math.max(budget, 0), keep);
+    if (!drop.length) return;
+
+    (async () => {
+      const store = getStore();
+      const nextSizes = { ...photoSizesRef.current };
+      for (const ck of drop) {
+        const [date, period, id] = ck.split(":");
+        try { await store.delete(storageKeyFor(date, period, id)); } catch { /* already gone */ }
+        delete nextSizes[ck];
+      }
+      photoSizesRef.current = nextSizes;
+      setPhotoSizes(nextSizes);
+      setPhotoCache((c) => {
+        const cc = { ...c };
+        drop.forEach((ck) => delete cc[ck]);
+        return cc;
+      });
+      saveJSON("nv-photo-sizes", nextSizes);
+    })();
+  }, [cloudEnabled, ready, quotaPct, dataBytesUsed, selectedDate, photoSync.atimes]);
+
+  // The sign-in screen sits behind both the session check and the local boot read, so
+  // returning to an app you're already signed into never flashes a login wall.
+  if (auth.status === "signed-out") {
+    return (
+      <Shell>
+        <SignInScreen
+          onGoogle={auth.signInWithGoogle}
+          onGuest={auth.continueAsGuest}
+          error={auth.error}
+          onDismissError={auth.clearError}
+        />
+      </Shell>
+    );
+  }
+
+  if (auth.status === "loading" || !ready) {
     return (
       <Shell>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: 18 }}>
@@ -739,6 +829,12 @@ export default function App() {
 
   const dayLog = getDayLog(selectedDate);
 
+  // A chosen display name wins over Google's, so the greeting can still read exactly
+  // "Naveen." even when the account says something more formal.
+  const greetingName = (displayName || auth.profile?.givenName || "").trim();
+  const monogram = (greetingName || auth.profile?.email || "G").trim().charAt(0).toUpperCase();
+  const avatarUrl = auth.profile?.avatarUrl || "";
+
   const pages = {
     today: (
       <TodayView
@@ -757,6 +853,10 @@ export default function App() {
           onAddStep={addStepForDay}
           onSkipStep={skipStepForDay}
           onUnskipStep={unskipStepForDay}
+          greetingName={greetingName}
+          monogram={monogram}
+          avatarUrl={avatarUrl}
+          onOpenAccount={() => setAccountOpen(true)}
       />
     ),
     shelf: <ProductsView products={products} logs={logs} onAdd={addProduct} onUpdate={updateProduct} onDelete={deleteProduct} onReorder={reorderInCategory} />,
@@ -871,9 +971,51 @@ export default function App() {
         }}
       />
 
+      <AnimatePresence>
+        {accountOpen && (
+          <AccountView
+            profile={auth.profile}
+            isGuest={auth.status === "guest"}
+            authEnabled={auth.authEnabled}
+            displayName={displayName}
+            greetingName={greetingName}
+            monogram={monogram}
+            products={products}
+            logs={logs}
+            syncStatus={sync.status}
+            lastSyncedAt={sync.lastSyncedAt}
+            onSyncNow={sync.syncNow}
+            onSetDisplayName={setDisplayName}
+            onExport={exportJSON}
+            quotaUsedMB={quotaUsedMB}
+            quotaPct={quotaPct}
+            onClose={() => setAccountOpen(false)}
+            onSignIn={auth.signInWithGoogle}
+            onSignOut={async () => { setAccountOpen(false); await auth.signOut(); }}
+            onDeleteEverything={async () => {
+              await removeAllRemote();
+              await sync.deleteRemote();
+              await clearNamespace(userId);
+              setAccountOpen(false);
+              window.location.reload();
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {sync.choice && (
+          <SyncChoiceSheet
+            local={sync.choice.local}
+            remote={sync.choice.remote}
+            onChoose={sync.resolveChoice}
+          />
+        )}
+      </AnimatePresence>
+
       <PhotoErrorToast message={photoError} onDismiss={() => setPhotoError(null)} />
       <SaveStatus status={saveStatus} />
-      <TabBar tab={tab} setTab={setTab} />
+      {!accountOpen && <TabBar tab={tab} setTab={setTab} />}
     </Shell>
   );
 }
@@ -1659,7 +1801,7 @@ function productStreakDays(logs, productId) {
 
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
 
-function TodayView({ products, selectedDate, setSelectedDate, dayLog, logs, toggleProduct, moveProduct, setMoodModal, setTab, onTriggerPhoto, photoIndex, onCopyYesterday, onAddStep, onSkipStep, onUnskipStep }) {
+function TodayView({ products, selectedDate, setSelectedDate, dayLog, logs, toggleProduct, moveProduct, setMoodModal, setTab, onTriggerPhoto, photoIndex, onCopyYesterday, onAddStep, onSkipStep, onUnskipStep, greetingName, monogram, avatarUrl, onOpenAccount }) {
   // the routine as it stood on the selected date, plus that day's own tweaks — never
   // today's product list projected backwards
   const amRoutine = routineFor(selectedDate, dayLog, products, "AM");
@@ -1763,16 +1905,8 @@ function TodayView({ products, selectedDate, setSelectedDate, dayLog, logs, togg
         icon={Droplet}
         minHeight={330}
         focus="62% 42%"
-        action={
-          <div style={{
-            width: 34, height: 34, borderRadius: 999, border: "1px solid var(--line-3)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgba(10,7,5,0.42)", backdropFilter: "blur(8px)",
-          }}>
-            <span className="u-display" style={{ fontSize: 15, color: "var(--gold)" }}>N</span>
-          </div>
-        }
-        title={<>{greetingWord()},<br /><span style={{ fontStyle: "italic", color: "var(--gold)" }}>Naveen.</span></>}
+        action={<AccountButton monogram={monogram} avatarUrl={avatarUrl} onClick={onOpenAccount} />}
+        title={<>{greetingWord()},<br /><span style={{ fontStyle: "italic", color: "var(--gold)" }}>{greetingName ? `${greetingName}.` : "you."}</span></>}
       >
         <p style={{ fontSize: 13, color: "var(--text-2)", margin: "14px 0 0", maxWidth: 224, lineHeight: 1.65, fontStyle: "italic" }}>
           {quote}
@@ -5144,6 +5278,495 @@ function ConfirmModal({ title, body, confirmLabel, onCancel, onConfirm }) {
         <PrimaryButton tone="danger" onClick={onConfirm} style={{ flex: 1 }}>{confirmLabel}</PrimaryButton>
       </div>
     </Sheet>
+  );
+}
+
+/* ------------------------------ account + auth ------------------------------ */
+
+// Google's mark, inline. The whole app is self-hosted and works offline; reaching out
+// to a CDN for one 18px logo would be the only thing on the page that doesn't.
+function GoogleMark({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-2.8-.4-4H24v7.3h12.1c-.2 2-1.6 5-4.5 7l-.1.3 6.5 5 .5.1c4.1-3.8 6.6-9.4 6.6-15.7z" />
+      <path fill="#34A853" d="M24 46c5.9 0 10.9-2 14.5-5.3l-6.9-5.4c-1.9 1.3-4.4 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.800000000000001l-.3.1-6.7 5.2-.1.3C7.9 40.9 15.4 46 24 46z" />
+      <path fill="#FBBC05" d="M11.5 27.7c-.5-1.4-.7-2.9-.7-4.5s.3-3.1.7-4.5v-.3l-6.8-5.3-.2.1C2.9 16.3 2 20 2 23.9s.9 7.6 2.5 10.8l7-7z" />
+      <path fill="#EA4335" d="M24 9.8c4.1 0 6.9 1.8 8.5 3.3l6.2-6C34.9 3.7 29.9 1.6 24 1.6 15.4 1.6 7.9 6.7 4.5 13.1l7 5.4C13.3 12.6 18.2 9.8 24 9.8z" />
+    </svg>
+  );
+}
+
+// Replaces the inert monogram that used to sit in the Routine header. Same 34px chip,
+// now a real control that opens the account page.
+function AccountButton({ monogram, avatarUrl, onClick }) {
+  const [broken, setBroken] = useState(false);
+  const showImage = avatarUrl && !broken;
+  return (
+    <motion.button
+      onClick={onClick}
+      whileTap={{ scale: 0.94 }}
+      transition={SPRING}
+      aria-label="Your account"
+      className="u-tap"
+      style={{
+        width: 34, height: 34, borderRadius: 999, border: "1px solid var(--line-3)",
+        display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
+        overflow: "hidden", background: "rgba(10,7,5,0.42)", backdropFilter: "blur(8px)",
+        WebkitBackdropFilter: "blur(8px)", flexShrink: 0,
+      }}
+    >
+      {showImage ? (
+        <img
+          src={avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)}
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+      ) : (
+        <span className="u-display" style={{ fontSize: 15, color: "var(--gold)" }}>{monogram || "G"}</span>
+      )}
+    </motion.button>
+  );
+}
+
+function SignInScreen({ onGoogle, onGuest, error, onDismissError }) {
+  const [busy, setBusy] = useState(false);
+
+  async function go() {
+    setBusy(true);
+    await onGoogle();
+    // A successful sign-in navigates away, so reaching here means it didn't start.
+    setBusy(false);
+  }
+
+  return (
+    <div style={{ position: "relative", minHeight: "100vh", display: "flex", flexDirection: "column", overflow: "hidden", isolation: "isolate" }}>
+      <img
+        src={HERO_IMG} alt="" aria-hidden="true" className="u-hero-img"
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", objectPosition: "62% 42%" }}
+      />
+      <div aria-hidden="true" style={{
+        position: "absolute", inset: 0,
+        background:
+          "radial-gradient(120% 80% at 8% 12%, rgba(10,7,5,0.94) 0%, rgba(10,7,5,0.62) 38%, rgba(10,7,5,0.08) 72%)," +
+          "linear-gradient(180deg, rgba(10,7,5,0.55) 0%, rgba(10,7,5,0.10) 22%, rgba(10,7,5,0.72) 58%, var(--ink-0) 88%)",
+      }} />
+      <div aria-hidden="true" style={{
+        position: "absolute", inset: 0,
+        background: "radial-gradient(70% 50% at 88% 6%, rgba(243,201,140,0.16), transparent 70%)",
+        mixBlendMode: "screen",
+      }} />
+
+      <div style={{ position: "relative", flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", padding: "0 24px calc(38px + env(safe-area-inset-bottom))" }}>
+        <motion.div
+          initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.7, ease: [0.22, 1, 0.36, 1] }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+            <Droplet size={14} color="var(--gold)" strokeWidth={2} />
+            <span className="u-eyebrow" style={{ color: "var(--gold)" }}>Skincare, kept honest</span>
+          </div>
+          <h1 className="u-display" style={{ fontSize: 46, color: "var(--text)", margin: 0, lineHeight: 1.02 }}>
+            Welcome to<br />
+            <span style={{ fontStyle: "italic", color: "var(--gold)" }}>Glass.</span>
+          </h1>
+          <p style={{ fontSize: 13.5, color: "var(--text-2)", margin: "16px 0 0", maxWidth: 280, lineHeight: 1.6 }}>
+            Your AM and PM routine, every product on your shelf, and the progress to prove
+            it's working — on every device you sign in from.
+          </p>
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6, delay: 0.16, ease: [0.22, 1, 0.36, 1] }}
+          style={{ marginTop: 30 }}
+        >
+          <AnimatePresence>
+            {error && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.24 }}
+                role="alert"
+                style={{ overflow: "hidden" }}
+              >
+                <div style={{
+                  display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 12,
+                  padding: "11px 13px", borderRadius: 14,
+                  background: "var(--rose-wash)", border: "1px solid rgba(226,160,141,0.3)",
+                }}>
+                  <AlertTriangle size={14} color="var(--rose)" style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span style={{ fontSize: 12, color: "var(--text-2)", lineHeight: 1.5, flex: 1 }}>{error}</span>
+                  <button onClick={onDismissError} aria-label="Dismiss" className="u-tap" style={{ background: "none", border: "none", padding: 0, flexShrink: 0 }}>
+                    <X size={13} color="var(--text-3)" />
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <motion.button
+            onClick={go}
+            disabled={busy}
+            whileTap={busy ? undefined : { scale: 0.98 }}
+            transition={SPRING}
+            className="u-tap"
+            style={{
+              width: "100%", padding: "14px 0", borderRadius: 14, border: "none",
+              background: "linear-gradient(180deg, var(--gold), var(--gold-2))",
+              color: "#20150C", fontSize: 14, fontWeight: 700, letterSpacing: "0.01em",
+              boxShadow: "0 10px 24px -12px rgba(243,201,140,0.6)",
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+              opacity: busy ? 0.6 : 1,
+            }}
+          >
+            {busy ? <Loader2 size={16} className="animate-spin" /> : <GoogleMark size={17} />}
+            {busy ? "Opening Google…" : "Continue with Google"}
+          </motion.button>
+
+          <button
+            onClick={onGuest}
+            className="u-tap"
+            style={{
+              display: "block", width: "100%", marginTop: 16, padding: "8px 0",
+              background: "none", border: "none",
+              fontSize: 12.5, color: "var(--text-3)", fontWeight: 500,
+            }}
+          >
+            Continue without an account
+          </button>
+          <p style={{ fontSize: 11, color: "var(--text-3)", textAlign: "center", margin: "4px 0 0", lineHeight: 1.55, opacity: 0.75 }}>
+            Everything stays on this phone until you sign in.
+          </p>
+        </motion.div>
+      </div>
+    </div>
+  );
+}
+
+// Settings row, built on the same recipe as the ExportSheet action card so the account
+// page reads as part of the app rather than a bolted-on preferences pane.
+function SettingRow({ icon: Icon, title, body, value, onClick, tone = "gold", disabled, danger }) {
+  const Comp = onClick && !disabled ? motion.button : "div";
+  const interactive = !!onClick && !disabled;
+  return (
+    <Comp
+      {...(interactive ? { onClick, whileTap: { scale: 0.985 }, transition: SPRING, className: "u-tap" } : {})}
+      style={{
+        width: "100%", textAlign: "left", borderRadius: 18, padding: 16, marginBottom: 10,
+        display: "flex", alignItems: "center", gap: 13,
+        border: `1px solid ${danger ? "rgba(226,160,141,0.28)" : "var(--line)"}`,
+        background: "linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.018))",
+        opacity: disabled ? 0.55 : 1,
+      }}
+    >
+      <div style={{
+        width: 36, height: 36, borderRadius: 999, flexShrink: 0,
+        background: danger ? "var(--rose-wash)" : TONES[tone].wash2,
+        border: `1px solid ${danger ? "rgba(226,160,141,0.3)" : "var(--line-2)"}`,
+        display: "flex", alignItems: "center", justifyContent: "center",
+      }}>
+        <Icon size={16} color={danger ? "var(--rose)" : TONES[tone].fg} />
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13.5, color: danger ? "var(--rose)" : "var(--text)", fontWeight: 600 }}>{title}</div>
+        {body && <div style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 4, lineHeight: 1.55 }}>{body}</div>}
+      </div>
+      {value && <span className="u-num" style={{ fontSize: 12, color: "var(--text-3)", flexShrink: 0 }}>{value}</span>}
+      {interactive && <ChevronRight size={15} color="var(--text-3)" style={{ flexShrink: 0 }} />}
+    </Comp>
+  );
+}
+
+const SYNC_COPY = {
+  syncing: { icon: RefreshCw, tone: "gold", title: "Syncing…", body: "Sending your latest changes." },
+  synced: { icon: Cloud, tone: "gold", title: "Everything's synced", body: "Your routine is safe on every device you sign in from." },
+  offline: { icon: WifiOff, tone: "moon", title: "Offline", body: "Changes are saved on this phone and will sync when you're back." },
+  error: { icon: CloudUpload, tone: "rose", title: "Couldn't sync", body: "Your data is safe here. Tap to try again." },
+  idle: { icon: Cloud, tone: "gold", title: "Ready to sync", body: "Your routine syncs automatically as you use the app." },
+};
+
+function SyncStatusCard({ status, lastSyncedAt, onSyncNow }) {
+  const spec = SYNC_COPY[status] || SYNC_COPY.idle;
+  const Icon = spec.icon;
+  const when = lastSyncedAt ? timeAgo(lastSyncedAt) : null;
+  const body = status === "synced" && when ? `Last synced ${when}.` : spec.body;
+  return (
+    <SettingRow
+      icon={Icon}
+      tone={spec.tone}
+      title={spec.title}
+      body={body}
+      onClick={status === "error" || status === "synced" || status === "idle" ? onSyncNow : undefined}
+    />
+  );
+}
+
+function timeAgo(ts) {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 45) return "just now";
+  if (s < 5400) return plural(Math.round(s / 60), "minute") + " ago";
+  if (s < 86400) return plural(Math.round(s / 3600), "hour") + " ago";
+  return plural(Math.round(s / 86400), "day") + " ago";
+}
+
+function DisplayNameSheet({ current, onSave, onClose }) {
+  const [value, setValue] = useState(current || "");
+  return (
+    <Sheet onClose={onClose} z={155} labelledBy="name-title">
+      <SheetHeader
+        id="name-title"
+        title="What should we call you?"
+        subtitle="This is the name in your morning greeting."
+        onClose={onClose}
+      />
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        maxLength={24}
+        autoFocus
+        aria-label="Display name"
+        placeholder="Your name"
+        style={{
+          width: "100%", padding: "13px 14px", borderRadius: 14, marginBottom: 14,
+          background: "rgba(255,255,255,0.04)", border: "1px solid var(--line-2)",
+          color: "var(--text)", fontSize: 14,
+        }}
+      />
+      <PrimaryButton onClick={() => { onSave(value); onClose(); }}>Save</PrimaryButton>
+    </Sheet>
+  );
+}
+
+/**
+ * The guest-data-meets-account-data decision. It only ever appears on the first sign-in
+ * from a phone that was already being used signed-out, and merging is offered first
+ * because it's the only option that can't lose anything.
+ */
+function SyncChoiceSheet({ local, remote, onChoose }) {
+  const count = (s) => {
+    const days = Object.keys(s.logs || {}).length;
+    const items = (s.products || []).length;
+    return `${plural(items, "product")} · ${plural(days, "logged day")}`;
+  };
+  return (
+    <Sheet onClose={() => onChoose("merge")} z={158} labelledBy="choice-title">
+      <SheetHeader
+        id="choice-title"
+        title="Two sets of data"
+        subtitle="This phone has a routine on it, and so does your account. Nothing is deleted until you pick."
+        onClose={() => onChoose("merge")}
+      />
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        {[["On this phone", count(local)], ["In your account", count(remote)]].map(([label, sub]) => (
+          <div key={label} style={{
+            flex: 1, borderRadius: 16, padding: "12px 13px",
+            border: "1px solid var(--line)", background: "rgba(255,255,255,0.03)",
+          }}>
+            <div className="u-eyebrow">{label}</div>
+            <div style={{ fontSize: 12, color: "var(--text-2)", marginTop: 6, lineHeight: 1.5 }}>{sub}</div>
+          </div>
+        ))}
+      </div>
+      <PrimaryButton onClick={() => onChoose("merge")} style={{ marginBottom: 8 }}>Merge both</PrimaryButton>
+      <div style={{ display: "flex", gap: 8 }}>
+        <GhostButton onClick={() => onChoose("local")} style={{ flex: 1 }}>Keep this phone's</GhostButton>
+        <GhostButton onClick={() => onChoose("remote")} style={{ flex: 1 }}>Use my account's</GhostButton>
+      </div>
+    </Sheet>
+  );
+}
+
+function AccountView({
+  profile, isGuest, authEnabled, displayName, greetingName, monogram,
+  products, logs, syncStatus, lastSyncedAt, onSyncNow, onSetDisplayName,
+  onExport, quotaUsedMB, quotaPct, onClose, onSignIn, onSignOut, onDeleteEverything,
+}) {
+  const reduce = useReducedMotion();
+  const [showExport, setShowExport] = useState(false);
+  const [showName, setShowName] = useState(false);
+  const [confirmWipe, setConfirmWipe] = useState(false);
+  const [avatarBroken, setAvatarBroken] = useState(false);
+
+  const stats = useMemo(() => {
+    const dates = Object.keys(logs || {});
+    const scored = dates.map((d) => dayCompletionPct(d, logs, products)).filter((p) => p > 0);
+    const rate = scored.length ? Math.round(scored.reduce((a, b) => a + b, 0) / scored.length) : 0;
+    return { days: scored.length, streak: currentStreakDays(logs, products), rate };
+  }, [logs, products]);
+
+  const since = useMemo(() => {
+    const iso = profile?.createdAt || Object.keys(logs || {}).sort()[0];
+    if (!iso) return null;
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }, [profile, logs]);
+
+  const showAvatar = profile?.avatarUrl && !avatarBroken;
+
+  return (
+    <motion.div
+      initial={{ x: reduce ? 0 : "100%", opacity: reduce ? 0 : 1 }}
+      animate={{ x: 0, opacity: 1 }}
+      exit={{ x: reduce ? 0 : "100%", opacity: reduce ? 0 : 1 }}
+      transition={reduce ? { duration: 0.15 } : { type: "spring", stiffness: 330, damping: 36 }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Your account"
+      style={{
+        position: "fixed", inset: 0, zIndex: 120, maxWidth: 480, margin: "0 auto",
+        background: "var(--ink-0)", overflowY: "auto", WebkitOverflowScrolling: "touch",
+      }}
+    >
+      <div style={{
+        position: "sticky", top: 0, zIndex: 2,
+        display: "flex", alignItems: "center", gap: 12,
+        padding: "calc(16px + env(safe-area-inset-top)) 20px 14px",
+        background: "linear-gradient(180deg, var(--ink-0) 62%, transparent)",
+      }}>
+        <button onClick={onClose} aria-label="Back" className="u-tap" style={iconBtnStyle}>
+          <ArrowLeft size={15} color="var(--text-2)" />
+        </button>
+        <span className="u-eyebrow">Account</span>
+      </div>
+
+      <div style={{ padding: "6px 20px calc(40px + env(safe-area-inset-bottom))" }}>
+        <Stagger>
+          <StaggerItem>
+            <div style={{ textAlign: "center", paddingBottom: 24 }}>
+              <div style={{
+                width: 78, height: 78, borderRadius: 999, margin: "0 auto 14px", overflow: "hidden",
+                border: "1px solid var(--line-3)", background: "var(--gold-wash)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                boxShadow: "0 14px 34px -18px rgba(243,201,140,0.5)",
+              }}>
+                {showAvatar ? (
+                  <img
+                    src={profile.avatarUrl} alt="" referrerPolicy="no-referrer"
+                    onError={() => setAvatarBroken(true)}
+                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                  />
+                ) : (
+                  <span className="u-display" style={{ fontSize: 32, color: "var(--gold)" }}>{monogram || "G"}</span>
+                )}
+              </div>
+              {/* Mirrors the greeting's own fallback ("Good Morning, you.") rather than
+                  announcing "Signed out" — the subtitle already says that, warmly. */}
+              <div className="u-display" style={{ fontSize: 27, color: "var(--text)" }}>
+                {greetingName || profile?.fullName || "You"}
+              </div>
+              <div style={{ fontSize: 12.5, color: "var(--text-3)", marginTop: 6 }}>
+                {isGuest ? "Not signed in — everything is on this phone" : profile?.email}
+              </div>
+              {since && (
+                <div className="u-eyebrow" style={{ marginTop: 12 }}>Since {since}</div>
+              )}
+            </div>
+          </StaggerItem>
+
+          <StaggerItem>
+            <div className="u-hairline" style={{ marginBottom: 20 }} />
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 28 }}>
+              <Stat value={stats.days} label="Days" size={30} />
+              <Stat value={stats.streak} label="Streak" size={30} tone="gold" />
+              <Stat value={stats.rate} unit="%" label="Completion" size={30} />
+            </div>
+          </StaggerItem>
+
+          <StaggerItem>
+            <Section title="Sync">
+              {isGuest ? (
+                <SettingRow
+                  icon={CloudUpload}
+                  title={authEnabled ? "Sign in with Google" : "Sync isn't set up on this build"}
+                  body={authEnabled
+                    ? "Back your routine up and pick it up on any other device."
+                    : "This copy runs entirely on your device."}
+                  onClick={authEnabled ? onSignIn : undefined}
+                />
+              ) : (
+                <SyncStatusCard status={syncStatus} lastSyncedAt={lastSyncedAt} onSyncNow={onSyncNow} />
+              )}
+            </Section>
+          </StaggerItem>
+
+          <StaggerItem>
+            <Section title="Preferences">
+              <SettingRow
+                icon={Pencil}
+                title="Display name"
+                body="The name in your morning greeting."
+                value={displayName || greetingName || "Not set"}
+                onClick={() => setShowName(true)}
+              />
+              <SettingRow
+                icon={Download}
+                title="Export your data"
+                body="Every product, day, mood and note as JSON."
+                onClick={() => setShowExport(true)}
+              />
+            </Section>
+          </StaggerItem>
+
+          <StaggerItem>
+            <Section
+              title="Storage"
+              hint={isGuest
+                ? "Photos live on this phone only. Sign in and they're backed up too."
+                : "What's cached here for offline use — your photos are safe in the cloud."}
+            >
+              <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} />
+            </Section>
+          </StaggerItem>
+
+          <StaggerItem>
+            <Section title="Account">
+              {!isGuest && (
+                <SettingRow
+                  icon={LogOut}
+                  title="Sign out"
+                  body="Your data stays on this phone for next time."
+                  onClick={onSignOut}
+                />
+              )}
+              <SettingRow
+                icon={Trash2}
+                danger
+                title="Delete everything"
+                body={isGuest
+                  ? "Wipes every product, day and photo on this phone."
+                  : "Wipes your routine here and in your account. This can't be undone."}
+                onClick={() => setConfirmWipe(true)}
+              />
+            </Section>
+          </StaggerItem>
+        </Stagger>
+      </div>
+
+      <AnimatePresence>
+        {showExport && <ExportSheet onClose={() => setShowExport(false)} onExportJSON={onExport} />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {showName && (
+          <DisplayNameSheet
+            current={displayName || greetingName}
+            onSave={onSetDisplayName}
+            onClose={() => setShowName(false)}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {confirmWipe && (
+          <ConfirmModal
+            title="Delete everything?"
+            body={isGuest
+              ? "Every product, logged day and progress photo on this phone will be permanently removed."
+              : "Every product, logged day and progress photo will be permanently removed from this phone and from your account."}
+            confirmLabel="Delete it all"
+            onCancel={() => setConfirmWipe(false)}
+            onConfirm={onDeleteEverything}
+          />
+        )}
+      </AnimatePresence>
+    </motion.div>
   );
 }
 

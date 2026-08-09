@@ -9,6 +9,8 @@ const URL = process.argv[3];
 const browser = await chromium.launch();
 const ctx = await browser.newContext({ ...devices["iPhone 15"] });
 const page = await ctx.newPage();
+// Skip the account gate — this audit is about layout on a real phone viewport.
+await page.addInitScript(() => { try { localStorage.setItem("glass:auth-mode", "guest"); } catch {} });
 const msgs = [];
 page.on("console", (m) => {
   if (m.type() === "error" || m.type() === "warning") msgs.push(`${m.type()}: ${m.text()}`);

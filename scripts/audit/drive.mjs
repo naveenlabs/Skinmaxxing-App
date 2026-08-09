@@ -14,9 +14,13 @@ export async function boot({ seed = true, days = 150, today = null, headless = t
   });
   page.on("pageerror", (e) => messages.push(`[pageerror] ${e.message}\n${e.stack || ""}`));
 
+  // Runs before the app on every navigation, so the account gate never stands between
+  // an audit and the screen it's checking.
+  await page.addInitScript(() => { try { localStorage.setItem("glass:auth-mode", "guest"); } catch {} });
+
   await page.goto("http://localhost:5173/", { waitUntil: "domcontentloaded" });
   if (empty) {
-    await page.evaluate(() => localStorage.clear());
+    await page.evaluate(() => { localStorage.clear(); localStorage.setItem("glass:auth-mode", "guest"); });
   } else if (seed) {
     const data = buildSeed({ days, today });
     if (products) data.products = products;
