@@ -13,10 +13,15 @@ import {
 import { useAuth } from "./lib/auth.js";
 import { useSync } from "./lib/sync.js";
 import { usePhotoSync, pickEvictions, localPhotoKey } from "./lib/photos.js";
-import { getStore, loadJSON, saveJSON, approxBytes, clearNamespace } from "./lib/store.js";
+import {
+  getStore, loadJSON, saveJSON, approxBytes, clearNamespace,
+  guestHasData, guestDataSummary, importGuestData,
+  readDeviceFlag, writeDeviceFlag, LAST_UID_KEY,
+} from "./lib/store.js";
 import {
   readPhoto, writePhoto, deletePhotoKeys, migrateLegacyPhotos,
-  clearPhotosForNamespace, localPhotoBytes,
+  clearPhotosForNamespace, importGuestPhotos,
+  readAvatar, writeAvatar, deleteAvatar,
 } from "./lib/photoStore.js";
 import { estimateStorage } from "./lib/idb.js";
 
@@ -345,6 +350,10 @@ export default function App() {
   const cloudEnabled = auth.status === "signed-in";
   const userId = auth.user?.id || null;
   const [accountOpen, setAccountOpen] = useState(false);
+  const [avatarDataUrl, setAvatarDataUrl] = useState(null);
+  const [guestOffer, setGuestOffer] = useState(null);
+  const [reloadToken, setReloadToken] = useState(0);
+  const avatarInputRef = useRef(null);
 
   // Which store everything belongs to. Null until auth settles, because useAuth sets the
   // storage namespace before it reports a status — reading first would load the signed-out
@@ -376,7 +385,10 @@ export default function App() {
   const sync = useSync({ enabled: cloudEnabled, userId, identityKey, docsRef, readyForRef, applyRemote });
   const { recordChange, displayName, setDisplayName } = sync;
   const photoSync = usePhotoSync({ enabled: cloudEnabled, userId, identityKey });
-  const { queueUpload, fetchRemote, removeRemote, removeAllRemote, touch: touchPhoto } = photoSync;
+  const {
+    queueUpload, fetchRemote, removeRemote, removeAllRemote, touch: touchPhoto,
+    uploadAvatar, fetchAvatar, deleteRemoteAvatar,
+  } = photoSync;
 
   useEffect(() => {
     if (!identityKey) return undefined;
@@ -396,6 +408,8 @@ export default function App() {
     photoSizesRef.current = {};
     setPhotoCache({});
     setSelectedDate(todayStr());
+    setAvatarDataUrl(null);
+    setGuestOffer(null);
 
     (async () => {
       try {
@@ -469,7 +483,78 @@ export default function App() {
     })();
 
     return () => { alive = false; };
-  }, [identityKey]);
+  }, [identityKey, reloadToken]);
+
+  /* --------------------------------- avatar --------------------------------- */
+
+  useEffect(() => {
+    if (!identityKey || readyForRef.current !== identityKey) return undefined;
+    let alive = true;
+    const epoch = identityKey;
+    (async () => {
+      const local = await readAvatar();
+      if (!alive || identityKeyRef.current !== epoch) return;
+      if (local) { setAvatarDataUrl(local); return; }
+      if (!cloudEnabled) return;
+      const remote = await fetchAvatar();
+      if (!alive || identityKeyRef.current !== epoch || !remote) return;
+      setAvatarDataUrl(remote);
+      writeAvatar(remote).catch(() => {}); // cache it so it renders offline next time
+    })();
+    return () => { alive = false; };
+  }, [identityKey, ready, cloudEnabled, fetchAvatar]);
+
+  async function applyAvatar(file) {
+    const r = await processAvatarFile(file);
+    if (!r.ok) { setPhotoError(r.error); return; }
+    // Local first so it appears instantly and survives with no network, then upstream.
+    await writeAvatar(r.blob);
+    setAvatarDataUrl(r.dataUrl);
+    if (cloudEnabled) {
+      const up = await uploadAvatar(r.blob);
+      if (!up.ok) setPhotoError("Saved on this phone — couldn't upload it yet.");
+    }
+  }
+
+  async function removeAvatarEverywhere() {
+    await deleteAvatar();
+    setAvatarDataUrl(null);
+    if (cloudEnabled) {
+      const r = await deleteRemoteAvatar();
+      if (!r.ok) setPhotoError("Removed here — couldn't reach your account to remove it there.");
+    }
+  }
+
+  /* ---------------------- guest data meeting an account ---------------------- */
+  // Nothing is copied implicitly. Once the account's own data has loaded we can tell
+  // whether this is a brand-new account (offer to bring the guest routine over) or an
+  // established one (say plainly that the guest data was left alone).
+
+  useEffect(() => {
+    if (!cloudEnabled || !userId) return;
+    if (readyForRef.current !== identityKey) return;
+    if (guestOffer) return;
+    if (readDeviceFlag(LAST_UID_KEY) === userId) return; // already answered on this device
+    if (!guestHasData()) return;
+    if (sync.status === "syncing" || sync.status === "idle") return; // let the first pull land
+
+    const accountEmpty = products.length === 0 && Object.keys(logs).length === 0;
+    setGuestOffer({ mode: accountEmpty ? "new" : "existing", summary: guestDataSummary() });
+  }, [cloudEnabled, userId, identityKey, ready, sync.status, products, logs, guestOffer]);
+
+  const answerGuestOffer = useCallback(async (bring) => {
+    const uid = userId;
+    setGuestOffer(null);
+    if (!uid) return;
+    if (bring) {
+      const r = await importGuestData(uid);
+      await importGuestPhotos(uid);
+      if (!r.complete) setPhotoError(r.error || "Couldn't bring everything over.");
+      setReloadToken((n) => n + 1); // re-read from the account namespace
+    }
+    // Either way, this device has now answered — don't ask again.
+    writeDeviceFlag(LAST_UID_KEY, uid);
+  }, [userId]);
 
   // recordChange diffs the outgoing value against what's currently in memory and stamps
   // only the entries that actually moved. Doing it here rather than at each mutation is
@@ -718,6 +803,52 @@ export default function App() {
     });
   }
 
+  // Same decode-then-commit shape as processPhotoFile: an unreadable or hostile file must
+  // never be able to destroy the avatar that's already there. Centre-cropped square so the
+  // circular frame never distorts, and re-encoded as JPEG so whatever was uploaded — SVG,
+  // a renamed executable, an enormous PNG — is discarded rather than stored.
+  const MAX_AVATAR_INPUT_BYTES = 12 * 1024 * 1024;
+  function processAvatarFile(file) {
+    return new Promise((resolve) => {
+      if (!file) return resolve({ ok: false, error: null });
+      if (!file.type || !file.type.startsWith("image/")) {
+        return resolve({ ok: false, error: "That doesn't look like an image." });
+      }
+      if (file.size > MAX_AVATAR_INPUT_BYTES) {
+        return resolve({ ok: false, error: "That image is too large — try one under 12MB." });
+      }
+      const reader = new FileReader();
+      reader.onerror = () => resolve({ ok: false, error: "Couldn't read that file — try again." });
+      reader.onload = (e) => {
+        const img = new window.Image();
+        img.onerror = () => resolve({ ok: false, error: "Couldn't process that image." });
+        img.onload = () => {
+          try {
+            const side = Math.min(img.width, img.height);
+            const sx = (img.width - side) / 2;
+            const sy = (img.height - side) / 2;
+            const out = 512;
+            const canvas = document.createElement("canvas");
+            canvas.width = out; canvas.height = out;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(img, sx, sy, side, side, 0, 0, out, out);
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+            canvas.toBlob(
+              (blob) => blob
+                ? resolve({ ok: true, dataUrl, blob })
+                : resolve({ ok: false, error: "Couldn't process that image." }),
+              "image/jpeg", 0.85
+            );
+          } catch {
+            resolve({ ok: false, error: "Couldn't process that image." });
+          }
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
   // Writes already-decoded photos to storage and updates the index in one pass.
   async function commitPhotos(date, period, items) {
     const sizeAdds = {};
@@ -881,6 +1012,9 @@ export default function App() {
         <SignInScreen
           onGoogle={auth.signInWithGoogle}
           onGuest={auth.continueAsGuest}
+          onSendCode={auth.sendCode}
+          onVerifyCode={auth.verifyCode}
+          authEnabled={auth.authEnabled}
           error={auth.error}
           onDismissError={auth.clearError}
         />
@@ -1066,8 +1200,12 @@ export default function App() {
         {accountOpen && (
           <AccountView
             profile={auth.profile}
-            isGuest={auth.status === "guest"}
+            mode={auth.status === "guest" ? "guest" : (auth.status === "offline-unverified" ? "offline" : "account")}
             authEnabled={auth.authEnabled}
+            avatarDataUrl={avatarDataUrl}
+            onPickAvatar={() => avatarInputRef.current && avatarInputRef.current.click()}
+            onRemoveAvatar={removeAvatarEverywhere}
+            onExitGuest={async () => { setAccountOpen(false); await auth.exitGuest(); }}
             displayName={displayName}
             greetingName={greetingName}
             monogram={monogram}
@@ -1124,6 +1262,24 @@ export default function App() {
           />
         )}
       </AnimatePresence>
+
+      <AnimatePresence>
+        {guestOffer && (
+          <GuestOfferSheet mode={guestOffer.mode} summary={guestOffer.summary} onAnswer={answerGuestOffer} />
+        )}
+      </AnimatePresence>
+
+      <input
+        ref={avatarInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: "none" }}
+        onChange={async (e) => {
+          const file = (e.target.files || [])[0];
+          e.target.value = "";
+          if (file) await applyAvatar(file);
+        }}
+      />
 
       <PhotoErrorToast message={photoError} onDismiss={() => setPhotoError(null)} />
       <SaveStatus status={saveStatus} />
@@ -5446,8 +5602,9 @@ function AccountButton({ monogram, avatarUrl, onClick }) {
   );
 }
 
-function SignInScreen({ onGoogle, onGuest, error, onDismissError }) {
+function SignInScreen({ onGoogle, onGuest, onSendCode, onVerifyCode, authEnabled, error, onDismissError }) {
   const [busy, setBusy] = useState(false);
+  const [codeOpen, setCodeOpen] = useState(false);
 
   async function go() {
     setBusy(true);
@@ -5540,6 +5697,20 @@ function SignInScreen({ onGoogle, onGuest, error, onDismissError }) {
             {busy ? "Opening Google…" : "Continue with Google"}
           </motion.button>
 
+          {authEnabled && (
+            <button
+              onClick={() => setCodeOpen(true)}
+              className="u-tap"
+              style={{
+                display: "block", width: "100%", marginTop: 12, padding: "11px 0",
+                borderRadius: 14, border: "1px solid var(--line-2)", background: "transparent",
+                color: "var(--text)", fontSize: 13, fontWeight: 600,
+              }}
+            >
+              Email me a code instead
+            </button>
+          )}
+
           <button
             onClick={onGuest}
             className="u-tap"
@@ -5556,7 +5727,179 @@ function SignInScreen({ onGoogle, onGuest, error, onDismissError }) {
           </p>
         </motion.div>
       </div>
+
+      <AnimatePresence>
+        {codeOpen && (
+          <CodeSignInSheet
+            onSend={onSendCode}
+            onVerify={onVerifyCode}
+            onClose={() => setCodeOpen(false)}
+          />
+        )}
+      </AnimatePresence>
     </div>
+  );
+}
+
+const RESEND_COOLDOWN_S = 45;
+const MAX_CODE_ATTEMPTS = 5;
+
+/**
+ * The second door. A full-page redirect is the only OAuth shape an installed iOS PWA
+ * handles reliably, and even that has been known to strand people in an in-app browser —
+ * a six-digit code involves no redirect at all, so it works everywhere.
+ *
+ * Requesting a code behaves identically for a known and an unknown address; nothing here
+ * reveals whether an account exists.
+ */
+function CodeSignInSheet({ onSend, onVerify, onClose }) {
+  const [step, setStep] = useState("email");
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [attempts, setAttempts] = useState(0);
+  const [cooldown, setCooldown] = useState(0);
+
+  useEffect(() => {
+    if (cooldown <= 0) return undefined;
+    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
+
+  async function send(isResend) {
+    if (busy || cooldown > 0) return;
+    setBusy(true);
+    setError(null);
+    const r = await onSend(email);
+    setBusy(false);
+    if (!r.ok) { setError(r.error); return; }
+    setStep("code");
+    setCooldown(RESEND_COOLDOWN_S);
+    if (isResend) { setCode(""); setAttempts(0); }
+  }
+
+  async function verify() {
+    if (busy) return;
+    if (attempts >= MAX_CODE_ATTEMPTS) {
+      setError("Too many attempts. Request a new code.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const r = await onVerify(email, code);
+    setBusy(false);
+    if (!r.ok) {
+      setAttempts((a) => a + 1);
+      setError(r.error);
+      return;
+    }
+    // Success closes itself: the auth state change swaps the whole screen out.
+  }
+
+  const inputStyle = {
+    width: "100%", padding: "13px 14px", borderRadius: 14,
+    background: "rgba(255,255,255,0.04)", border: "1px solid var(--line-2)",
+    color: "var(--text)", fontSize: 15,
+  };
+
+  return (
+    <Sheet onClose={onClose} z={158} labelledBy="code-title">
+      <SheetHeader
+        id="code-title"
+        title={step === "email" ? "Sign in with a code" : "Check your email"}
+        subtitle={step === "email"
+          ? "We'll email you a six-digit code. No password, no redirect."
+          : `We sent a six-digit code to ${email}.`}
+        onClose={onClose}
+      />
+
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.2 }}
+            role="alert"
+            style={{ overflow: "hidden" }}
+          >
+            <div style={{
+              display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 12,
+              padding: "11px 13px", borderRadius: 14,
+              background: "var(--rose-wash)", border: "1px solid rgba(226,160,141,0.3)",
+            }}>
+              <AlertTriangle size={14} color="var(--rose)" style={{ flexShrink: 0, marginTop: 1 }} />
+              <span style={{ fontSize: 12, color: "var(--text-2)", lineHeight: 1.5 }}>{error}</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {step === "email" ? (
+        <>
+          <input
+            type="email"
+            inputMode="email"
+            autoComplete="email"
+            autoFocus
+            aria-label="Email address"
+            placeholder="you@example.com"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") send(false); }}
+            style={{ ...inputStyle, marginBottom: 14 }}
+          />
+          <PrimaryButton onClick={() => send(false)} disabled={busy || !email}>
+            {busy ? "Sending…" : "Email me a code"}
+          </PrimaryButton>
+        </>
+      ) : (
+        <>
+          <input
+            type="text"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            autoFocus
+            maxLength={6}
+            aria-label="Six-digit code"
+            placeholder="000000"
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+            onKeyDown={(e) => { if (e.key === "Enter") verify(); }}
+            className="u-num"
+            style={{
+              ...inputStyle, marginBottom: 14,
+              textAlign: "center", fontSize: 26, letterSpacing: "0.34em", fontWeight: 600,
+            }}
+          />
+          <PrimaryButton onClick={verify} disabled={busy || code.length < 6}>
+            {busy ? "Checking…" : "Verify and sign in"}
+          </PrimaryButton>
+          <button
+            onClick={() => send(true)}
+            disabled={cooldown > 0 || busy}
+            className="u-tap"
+            style={{
+              display: "block", width: "100%", marginTop: 14, padding: "8px 0",
+              background: "none", border: "none",
+              fontSize: 12.5, color: cooldown > 0 ? "var(--text-3)" : "var(--gold)",
+              fontWeight: 500, opacity: cooldown > 0 ? 0.6 : 1,
+            }}
+          >
+            {cooldown > 0 ? `Send another code in ${cooldown}s` : "Send another code"}
+          </button>
+          <button
+            onClick={() => { setStep("email"); setCode(""); setError(null); setAttempts(0); }}
+            className="u-tap"
+            style={{
+              display: "block", width: "100%", marginTop: 2, padding: "6px 0",
+              background: "none", border: "none", fontSize: 12, color: "var(--text-3)",
+            }}
+          >
+            Use a different email
+          </button>
+        </>
+      )}
+    </Sheet>
   );
 }
 
@@ -5693,18 +6036,31 @@ function SyncChoiceSheet({ local, remote, onChoose }) {
   );
 }
 
+/**
+ * Renders strictly from the authentication state, so it can never offer to sign in to
+ * someone who already is, or hide a sign-out from someone who is signed in.
+ *
+ * @param {"guest"|"account"|"offline"} mode
+ */
 function AccountView({
-  profile, isGuest, authEnabled, displayName, greetingName, monogram,
+  profile, mode, authEnabled, displayName, greetingName, monogram, avatarDataUrl,
   products, logs, syncStatus, lastSyncedAt, onSyncNow, onSetDisplayName,
-  onExport, quotaUsedMB, quotaPct, quotaTotalMB, onClose, onSignIn, onSignOut, onDeleteEverything,
+  onExport, quotaUsedMB, quotaPct, quotaTotalMB,
+  onClose, onSignIn, onSignOut, onExitGuest, onDeleteEverything,
+  onPickAvatar, onRemoveAvatar,
 }) {
   const reduce = useReducedMotion();
   const [showExport, setShowExport] = useState(false);
   const [showName, setShowName] = useState(false);
+  const [showAvatarSheet, setShowAvatarSheet] = useState(false);
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [confirmExitGuest, setConfirmExitGuest] = useState(false);
   const [wiping, setWiping] = useState(false);
   const [wipeError, setWipeError] = useState(null);
-  const [avatarBroken, setAvatarBroken] = useState(false);
+  const [googleAvatarBroken, setGoogleAvatarBroken] = useState(false);
+
+  const isGuest = mode === "guest";
+  const isOffline = mode === "offline";
 
   const stats = useMemo(() => {
     const dates = Object.keys(logs || {});
@@ -5714,14 +6070,16 @@ function AccountView({
   }, [logs, products]);
 
   const since = useMemo(() => {
-    const iso = profile?.createdAt || Object.keys(logs || {}).sort()[0];
+    const iso = (!isGuest && profile?.createdAt) || Object.keys(logs || {}).sort()[0];
     if (!iso) return null;
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return null;
     return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-  }, [profile, logs]);
+  }, [profile, logs, isGuest]);
 
-  const showAvatar = profile?.avatarUrl && !avatarBroken;
+  // Uploaded picture wins, then whatever Google gave us, then the monogram.
+  const avatarSrc = avatarDataUrl || (!googleAvatarBroken && !isGuest ? profile?.avatarUrl : "") || "";
+  const hasOwnAvatar = !!avatarDataUrl;
 
   return (
     <motion.div
@@ -5753,33 +6111,50 @@ function AccountView({
         <Stagger>
           <StaggerItem>
             <div style={{ textAlign: "center", paddingBottom: 24 }}>
-              <div style={{
-                width: 78, height: 78, borderRadius: 999, margin: "0 auto 14px", overflow: "hidden",
-                border: "1px solid var(--line-3)", background: "var(--gold-wash)",
-                display: "flex", alignItems: "center", justifyContent: "center",
-                boxShadow: "0 14px 34px -18px rgba(243,201,140,0.5)",
-              }}>
-                {showAvatar ? (
-                  <img
-                    src={profile.avatarUrl} alt="" referrerPolicy="no-referrer"
-                    onError={() => setAvatarBroken(true)}
-                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                  />
-                ) : (
-                  <span className="u-display" style={{ fontSize: 32, color: "var(--gold)" }}>{monogram || "G"}</span>
-                )}
-              </div>
-              {/* Mirrors the greeting's own fallback ("Good Morning, you.") rather than
-                  announcing "Signed out" — the subtitle already says that, warmly. */}
+              <motion.button
+                onClick={() => setShowAvatarSheet(true)}
+                whileTap={{ scale: 0.96 }}
+                transition={SPRING}
+                aria-label={hasOwnAvatar ? "Change your profile picture" : "Add a profile picture"}
+                className="u-tap"
+                style={{
+                  position: "relative", width: 78, height: 78, borderRadius: 999,
+                  margin: "0 auto 14px", padding: 0, overflow: "visible",
+                  border: "1px solid var(--line-3)", background: "var(--gold-wash)",
+                  display: "block", boxShadow: "0 14px 34px -18px rgba(243,201,140,0.5)",
+                }}
+              >
+                <span style={{
+                  position: "absolute", inset: 0, borderRadius: 999, overflow: "hidden",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  {avatarSrc ? (
+                    <img
+                      src={avatarSrc} alt="" referrerPolicy="no-referrer"
+                      onError={() => setGoogleAvatarBroken(true)}
+                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                    />
+                  ) : (
+                    <span className="u-display" style={{ fontSize: 32, color: "var(--gold)" }}>{monogram || "G"}</span>
+                  )}
+                </span>
+                <span aria-hidden="true" style={{
+                  position: "absolute", right: -2, bottom: -2,
+                  width: 26, height: 26, borderRadius: 999,
+                  background: "var(--ink-1)", border: "1px solid var(--line-2)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <Camera size={12} color="var(--gold)" />
+                </span>
+              </motion.button>
+
               <div className="u-display" style={{ fontSize: 27, color: "var(--text)" }}>
-                {greetingName || profile?.fullName || "You"}
+                {greetingName || (!isGuest && profile?.fullName) || "You"}
               </div>
               <div style={{ fontSize: 12.5, color: "var(--text-3)", marginTop: 6 }}>
                 {isGuest ? "Not signed in — everything is on this phone" : profile?.email}
               </div>
-              {since && (
-                <div className="u-eyebrow" style={{ marginTop: 12 }}>Since {since}</div>
-              )}
+              {since && <div className="u-eyebrow" style={{ marginTop: 12 }}>Since {since}</div>}
             </div>
           </StaggerItem>
 
@@ -5793,17 +6168,26 @@ function AccountView({
           </StaggerItem>
 
           <StaggerItem>
-            <Section title="Sync">
-              {isGuest ? (
+            <Section title={isGuest ? "Your data" : "Sync"}>
+              {isGuest && (
                 <SettingRow
                   icon={CloudUpload}
-                  title={authEnabled ? "Sign in with Google" : "Sync isn't set up on this build"}
+                  title={authEnabled ? "Sign in to sync" : "Sync isn't set up on this build"}
                   body={authEnabled
-                    ? "Back your routine up and pick it up on any other device."
+                    ? "Back this routine up and pick it up on any other device. Your data stays here either way."
                     : "This copy runs entirely on your device."}
                   onClick={authEnabled ? onSignIn : undefined}
                 />
-              ) : (
+              )}
+              {isOffline && (
+                <SettingRow
+                  icon={WifiOff}
+                  tone="moon"
+                  title="Offline"
+                  body="You're signed in, but we can't reach your account right now. Everything you do is saved here and syncs when you're back."
+                />
+              )}
+              {mode === "account" && (
                 <SyncStatusCard status={syncStatus} lastSyncedAt={lastSyncedAt} onSyncNow={onSyncNow} />
               )}
             </Section>
@@ -5832,7 +6216,7 @@ function AccountView({
               title="Storage"
               hint={isGuest
                 ? "Photos live on this phone only. Sign in and they're backed up too."
-                : "What's cached here for offline use — your photos are safe in the cloud."}
+                : "What this site is using on this device — your photos are safe in the cloud."}
             >
               <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} totalMB={quotaTotalMB} />
             </Section>
@@ -5840,7 +6224,14 @@ function AccountView({
 
           <StaggerItem>
             <Section title="Account">
-              {!isGuest && (
+              {isGuest ? (
+                <SettingRow
+                  icon={LogOut}
+                  title="Exit guest mode"
+                  body="Go back to the sign-in screen. Your data stays on this phone."
+                  onClick={() => setConfirmExitGuest(true)}
+                />
+              ) : (
                 <SettingRow
                   icon={LogOut}
                   title="Sign out"
@@ -5875,6 +6266,27 @@ function AccountView({
         )}
       </AnimatePresence>
       <AnimatePresence>
+        {showAvatarSheet && (
+          <AvatarSheet
+            hasPicture={hasOwnAvatar}
+            onPick={() => { setShowAvatarSheet(false); onPickAvatar(); }}
+            onRemove={async () => { setShowAvatarSheet(false); await onRemoveAvatar(); }}
+            onClose={() => setShowAvatarSheet(false)}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {confirmExitGuest && (
+          <ConfirmModal
+            title="Leave guest mode?"
+            body="Your routine is only on this phone. It'll still be here when you come back, but clearing your browser data, switching devices or losing this phone would take it with them — signing in with Google is what makes it recoverable."
+            confirmLabel="Leave guest mode"
+            onCancel={() => setConfirmExitGuest(false)}
+            onConfirm={() => { setConfirmExitGuest(false); onExitGuest(); }}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
         {confirmWipe && (
           <ConfirmModal
             title="Delete everything?"
@@ -5896,6 +6308,91 @@ function AccountView({
         )}
       </AnimatePresence>
     </motion.div>
+  );
+}
+
+function AvatarSheet({ hasPicture, onPick, onRemove, onClose }) {
+  return (
+    <Sheet onClose={onClose} z={155} labelledBy="avatar-title">
+      <SheetHeader
+        id="avatar-title"
+        title="Profile picture"
+        subtitle="Square-cropped and kept small — yours only."
+        onClose={onClose}
+      />
+      <SettingRow
+        icon={Camera}
+        title={hasPicture ? "Choose a different picture" : "Choose a picture"}
+        body="From your photos or camera roll."
+        onClick={onPick}
+      />
+      {hasPicture && (
+        <SettingRow
+          icon={Trash2}
+          danger
+          title="Remove picture"
+          body="Falls back to your initial."
+          onClick={onRemove}
+        />
+      )}
+    </Sheet>
+  );
+}
+
+/**
+ * Shown once per device when someone signs in with guest data sitting on the phone.
+ * A brand-new account is offered the data; an account that already has a routine is told
+ * plainly that nothing was merged, because silently combining two people's data — or two
+ * of your own histories — is not recoverable.
+ */
+function GuestOfferSheet({ mode, summary, onAnswer }) {
+  const what = `${plural(summary.products, "product")} · ${plural(summary.days, "logged day")}`;
+  if (mode === "new") {
+    return (
+      <Sheet onClose={() => onAnswer(false)} z={158} labelledBy="guest-offer-title">
+        <SheetHeader
+          id="guest-offer-title"
+          title="Bring your routine with you?"
+          subtitle="You'd been using Glass without an account. That data is still on this phone."
+          onClose={() => onAnswer(false)}
+        />
+        <div style={{
+          borderRadius: 16, padding: "12px 14px", marginBottom: 16,
+          border: "1px solid var(--line)", background: "rgba(255,255,255,0.03)",
+        }}>
+          <div className="u-eyebrow">On this phone</div>
+          <div style={{ fontSize: 12.5, color: "var(--text-2)", marginTop: 6 }}>{what}</div>
+        </div>
+        <PrimaryButton onClick={() => onAnswer(true)} style={{ marginBottom: 8 }}>
+          Bring it over
+        </PrimaryButton>
+        <GhostButton onClick={() => onAnswer(false)}>Start this account fresh</GhostButton>
+        <p style={{ fontSize: 11, color: "var(--text-3)", textAlign: "center", margin: "12px 0 0", lineHeight: 1.55 }}>
+          Either way nothing is deleted — the guest copy stays on this phone.
+        </p>
+      </Sheet>
+    );
+  }
+  return (
+    <Sheet onClose={() => onAnswer(false)} z={158} labelledBy="guest-offer-title">
+      <SheetHeader
+        id="guest-offer-title"
+        title="This account already has a routine"
+        subtitle="So we left the guest data on this phone alone rather than mixing the two together."
+        onClose={() => onAnswer(false)}
+      />
+      <div style={{
+        borderRadius: 16, padding: "12px 14px", marginBottom: 16,
+        border: "1px solid var(--line)", background: "rgba(255,255,255,0.03)",
+      }}>
+        <div className="u-eyebrow">Still on this phone, untouched</div>
+        <div style={{ fontSize: 12.5, color: "var(--text-2)", marginTop: 6 }}>{what}</div>
+        <div style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8, lineHeight: 1.55 }}>
+          Sign out and choose "Continue without an account" to get back to it.
+        </div>
+      </div>
+      <PrimaryButton onClick={() => onAnswer(false)}>Got it</PrimaryButton>
+    </Sheet>
   );
 }
 

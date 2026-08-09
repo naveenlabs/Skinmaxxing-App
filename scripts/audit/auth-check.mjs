@@ -73,7 +73,8 @@ await page.waitForTimeout(900);
 const acct = await page.evaluate(() => document.body.innerText);
 check("account page opens", /Account/i.test(acct));
 check("guest state is stated plainly", /Not signed in/i.test(acct));
-check("sync section invites sign-in", /Sign in with Google/i.test(acct));
+check("guest is invited to sign in", /Sign in to sync/i.test(acct));
+check("guest is offered a way out of guest mode", /Exit guest mode/i.test(acct));
 check("preferences present", /Display name/i.test(acct) && /Export your data/i.test(acct));
 check("storage section present", /Storage/i.test(acct));
 check("destructive action present", /Delete everything/i.test(acct));
@@ -167,6 +168,8 @@ check("account shows the email", /naveen@example\.com/.test(acct2));
 check("member-since reflects the account", /Since February 2026/i.test(acct2), acct2.match(/Since [^\n]*/)?.[0] || "");
 check("sign out is offered when signed in", /Sign out/i.test(acct2));
 check("guest copy is gone", !/Not signed in/i.test(acct2));
+check("signed-in user is never offered a second sign-in", !/Sign in to sync/i.test(acct2));
+check("signed-in user is not offered guest controls", !/Exit guest mode/i.test(acct2));
 check("unreachable project surfaces an honest sync state",
   /Couldn't sync|Syncing|Offline|Ready to sync|synced/i.test(acct2));
 await page.screenshot({ path: `${OUT}/shots/auth-signed-in.png` });

@@ -186,6 +186,67 @@ export function pendingMigration() {
   return j && j.to ? j : null;
 }
 
+// The documents a guest actually owns. Deliberately not everything under the namespace:
+// sync bookkeeping (nv-meta, nv-synced-once, upload queues) belongs to whichever identity
+// produced it and must not be carried into an account.
+export const GUEST_DATA_KEYS = [
+  "nv-products", "nv-logs", "nv-photo-index", "nv-photo-sizes", "nv-profile",
+];
+
+/** Does the signed-out namespace hold anything worth offering to carry over? */
+export function guestHasData() {
+  if (typeof window === "undefined" || isArtifactRuntime()) return false;
+  try {
+    const products = JSON.parse(window.localStorage.getItem(`${LS_PREFIX}nv-products`) || "[]");
+    const logs = JSON.parse(window.localStorage.getItem(`${LS_PREFIX}nv-logs`) || "{}");
+    const index = JSON.parse(window.localStorage.getItem(`${LS_PREFIX}nv-photo-index`) || "{}");
+    return (Array.isArray(products) && products.length > 0)
+      || Object.keys(logs || {}).length > 0
+      || Object.keys(index || {}).length > 0;
+  } catch { return false; }
+}
+
+/** A short summary of the guest data, for the sheet that offers to carry it over. */
+export function guestDataSummary() {
+  if (typeof window === "undefined" || isArtifactRuntime()) return { products: 0, days: 0 };
+  try {
+    const products = JSON.parse(window.localStorage.getItem(`${LS_PREFIX}nv-products`) || "[]");
+    const logs = JSON.parse(window.localStorage.getItem(`${LS_PREFIX}nv-logs`) || "{}");
+    return {
+      products: Array.isArray(products) ? products.length : 0,
+      days: Object.keys(logs || {}).length,
+    };
+  } catch { return { products: 0, days: 0 }; }
+}
+
+/**
+ * Copy the guest documents into an account's namespace. The guest namespace is left
+ * completely intact — carrying data over is not the same as giving it up, and the user
+ * can still switch back to guest mode and find everything where they left it.
+ */
+export async function importGuestData(uid) {
+  if (typeof window === "undefined" || isArtifactRuntime() || !uid) {
+    return { copied: 0, total: 0, complete: true, error: null };
+  }
+  const to = nsFor(uid);
+  let copied = 0;
+  let error = null;
+  for (const key of GUEST_DATA_KEYS) {
+    try {
+      const v = window.localStorage.getItem(LS_PREFIX + key);
+      if (v == null) continue;
+      window.localStorage.setItem(LS_PREFIX + to + key, v);
+      copied++;
+    } catch (e) {
+      error = e?.name === "QuotaExceededError"
+        ? "Ran out of space on this device partway through."
+        : (e?.message || "Copy failed.");
+      break;
+    }
+  }
+  return { copied, total: GUEST_DATA_KEYS.length, complete: !error, error };
+}
+
 /** Forget everything in one namespace once the user has confirmed it's been carried over. */
 export async function retireNamespace(uid) {
   return clearNamespace(uid);

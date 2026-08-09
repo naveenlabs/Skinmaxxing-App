@@ -139,4 +139,61 @@ export async function migrateLegacyPhotos() {
   return moved;
 }
 
+/**
+ * Copy the guest namespace's photo blobs into an account's. Like importGuestData, the
+ * source is left untouched — this is a copy, not a handover.
+ */
+export async function importGuestPhotos(uid) {
+  if (isArtifactRuntime() || !useIdb() || !uid) return 0;
+  const to = `u_${uid}:`;
+  const guestKeys = (await idbKeys("photo:")).filter((k) => !String(k).startsWith("u_"));
+  let copied = 0;
+  for (const key of guestKeys) {
+    try {
+      const blob = await idbGet(key);
+      if (!blob) continue;
+      await idbSet(to + key, blob);
+      copied++;
+    } catch { break; }
+  }
+  return copied;
+}
+
+/* ---------------------------------- avatars ---------------------------------- */
+// Guests keep an avatar locally under the same store; signed-in users get theirs from
+// Supabase Storage and cache it here so it renders offline.
+
+const AVATAR_KEY = "avatar";
+
+export async function readAvatar() {
+  if (isArtifactRuntime()) {
+    try { return (await getStore()?.get(AVATAR_KEY))?.value || null; } catch { return null; }
+  }
+  if (!useIdb()) {
+    try { return window.localStorage.getItem(LS_PREFIX + scoped(AVATAR_KEY)); } catch { return null; }
+  }
+  const blob = await idbGet(scoped(AVATAR_KEY));
+  if (!blob) return null;
+  try { return await blobToDataUrl(blob); } catch { return null; }
+}
+
+export async function writeAvatar(value) {
+  const blob = typeof value === "string" ? dataUrlToBlob(value) : value;
+  if (isArtifactRuntime()) {
+    const dataUrl = typeof value === "string" ? value : await blobToDataUrl(blob);
+    await getStore()?.set(AVATAR_KEY, dataUrl);
+    return blob.size;
+  }
+  if (useIdb()) { await idbSet(scoped(AVATAR_KEY), blob); return blob.size; }
+  const dataUrl = typeof value === "string" ? value : await blobToDataUrl(blob);
+  window.localStorage.setItem(LS_PREFIX + scoped(AVATAR_KEY), dataUrl);
+  return blob.size;
+}
+
+export async function deleteAvatar() {
+  if (isArtifactRuntime()) { await getStore()?.delete(AVATAR_KEY).catch(() => {}); return; }
+  if (useIdb()) await idbDelete(scoped(AVATAR_KEY));
+  try { window.localStorage.removeItem(LS_PREFIX + scoped(AVATAR_KEY)); } catch { /* ignore */ }
+}
+
 export { idbDelete };

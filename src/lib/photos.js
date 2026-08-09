@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { supabase, PHOTO_BUCKET } from "./supabase.js";
+import { supabase, PHOTO_BUCKET, AVATAR_BUCKET } from "./supabase.js";
 import { loadJSON, saveJSON, getStore, approxBytes } from "./store.js";
 
 /*
@@ -34,6 +34,12 @@ export function dataUrlToBlob(dataUrl) {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return new Blob([bytes], { type: mime });
+}
+
+/** A downloaded object is only usable if it really is an image with bytes in it. */
+export function isImageBlob(b) {
+  return !!b && typeof b.size === "number" && b.size > 0
+    && typeof b.type === "string" && b.type.startsWith("image/");
 }
 
 export function blobToDataUrl(blob) {
@@ -171,7 +177,7 @@ export function usePhotoSync({ enabled, userId, identityKey }) {
     try {
       const { data, error } = await supabase.storage
         .from(PHOTO_BUCKET).download(photoPath(userId, date, period, id));
-      if (error || !data) return null;
+      if (error || !isImageBlob(data)) return null;
       return await blobToDataUrl(data);
     } catch { return null; }
   }, [enabled, userId]);
@@ -229,11 +235,47 @@ export function usePhotoSync({ enabled, userId, identityKey }) {
     await Promise.all([saveJSON(QUEUE_KEY, {}), saveJSON(DELETE_QUEUE_KEY, [])]);
   }, [enabled, userId]);
 
+  /* ---------------------------------- avatar ---------------------------------- */
+  // Its own bucket with its own size and MIME limits, and a path keyed on the user id so
+  // storage RLS can enforce that nobody can read or overwrite anyone else's.
+
+  const avatarPath = useCallback(() => `${userId}/avatar.jpg`, [userId]);
+
+  const uploadAvatar = useCallback(async (blob) => {
+    if (!enabled || !userId || !supabase) return { ok: true, local: true };
+    const { error } = await supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(avatarPath(), blob, { contentType: "image/jpeg", upsert: true });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  }, [enabled, userId, avatarPath]);
+
+  const fetchAvatar = useCallback(async () => {
+    if (!enabled || !userId || !supabase) return null;
+    try {
+      const { data, error } = await supabase.storage.from(AVATAR_BUCKET).download(avatarPath());
+      // Don't trust the response to be an image just because it was a 200 — an error
+      // body would otherwise be turned into a data URL and rendered as a broken avatar.
+      if (error || !isImageBlob(data)) return null;
+      return await blobToDataUrl(data);
+    } catch { return null; }
+  }, [enabled, userId, avatarPath]);
+
+  const deleteRemoteAvatar = useCallback(async () => {
+    if (!enabled || !userId || !supabase) return { ok: true };
+    const { error } = await supabase.storage.from(AVATAR_BUCKET).remove([avatarPath()]);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  }, [enabled, userId, avatarPath]);
+
   const pendingCount = useCallback(
     () => Object.keys(queueRef.current).length + deleteQueueRef.current.length, []
   );
 
-  return { queueUpload, fetchRemote, removeRemote, removeAllRemote, touch, atimes: atimeRef, pendingCount, flush };
+  return {
+    queueUpload, fetchRemote, removeRemote, removeAllRemote, touch, atimes: atimeRef,
+    pendingCount, flush, uploadAvatar, fetchAvatar, deleteRemoteAvatar,
+  };
 }
 
 export { approxBytes };
