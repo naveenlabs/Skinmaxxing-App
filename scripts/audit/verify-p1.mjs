@@ -307,7 +307,16 @@ function check(name, ok, detail = "") {
   const btn = page.getByText(/^Clean up 90\+ days/);
   const label = await btn.first().textContent();
   check("cleanup button shows how many it will delete", /\(\d+\)/.test(label), label);
-  const beforeCount = await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("glass:photo:")).length);
+  const beforeCount = await page.evaluate(() => (async () => {
+    // Photos live in IndexedDB now, not localStorage.
+    const db = await new Promise((res) => { const r = indexedDB.open("glass", 1); r.onsuccess = () => res(r.result); r.onerror = () => res(null); });
+    if (!db) return 0;
+    return await new Promise((res) => {
+      const req = db.transaction("photos", "readonly").objectStore("photos").getAllKeys();
+      req.onsuccess = () => res((req.result || []).filter((k) => String(k).startsWith("photo:")).length);
+      req.onerror = () => res(0);
+    });
+  })());
   await btn.first().click();
   await page.waitForTimeout(500);
   const confirmShown = await page.evaluate(() => /can't be undone/.test(document.body.innerText));
@@ -315,13 +324,31 @@ function check(name, ok, detail = "") {
   await page.screenshot({ path: `${OUT}/shots/fix-cleanup-confirm.png` });
   await page.getByText("Keep them").click();
   await page.waitForTimeout(500);
-  const afterCancel = await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("glass:photo:")).length);
+  const afterCancel = await page.evaluate(() => (async () => {
+    // Photos live in IndexedDB now, not localStorage.
+    const db = await new Promise((res) => { const r = indexedDB.open("glass", 1); r.onsuccess = () => res(r.result); r.onerror = () => res(null); });
+    if (!db) return 0;
+    return await new Promise((res) => {
+      const req = db.transaction("photos", "readonly").objectStore("photos").getAllKeys();
+      req.onsuccess = () => res((req.result || []).filter((k) => String(k).startsWith("photo:")).length);
+      req.onerror = () => res(0);
+    });
+  })());
   check("cancelling keeps every photo", beforeCount === afterCancel, `${beforeCount} -> ${afterCancel}`);
   await btn.first().click();
   await page.waitForTimeout(400);
   await page.getByText("Delete them").click();
   await page.waitForTimeout(1200);
-  const afterConfirm = await page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("glass:photo:")).length);
+  const afterConfirm = await page.evaluate(() => (async () => {
+    // Photos live in IndexedDB now, not localStorage.
+    const db = await new Promise((res) => { const r = indexedDB.open("glass", 1); r.onsuccess = () => res(r.result); r.onerror = () => res(null); });
+    if (!db) return 0;
+    return await new Promise((res) => {
+      const req = db.transaction("photos", "readonly").objectStore("photos").getAllKeys();
+      req.onsuccess = () => res((req.result || []).filter((k) => String(k).startsWith("photo:")).length);
+      req.onerror = () => res(0);
+    });
+  })());
   check("confirming actually deletes", afterConfirm < beforeCount, `${beforeCount} -> ${afterConfirm}`);
   check("console clean (cleanup)", messages.length === 0, messages.join(" | "));
   await browser.close();

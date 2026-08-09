@@ -14,6 +14,11 @@ import { useAuth } from "./lib/auth.js";
 import { useSync } from "./lib/sync.js";
 import { usePhotoSync, pickEvictions, localPhotoKey } from "./lib/photos.js";
 import { getStore, loadJSON, saveJSON, approxBytes, clearNamespace } from "./lib/store.js";
+import {
+  readPhoto, writePhoto, deletePhotoKeys, migrateLegacyPhotos,
+  clearPhotosForNamespace, localPhotoBytes,
+} from "./lib/photoStore.js";
+import { estimateStorage } from "./lib/idb.js";
 
 /* ---------------------------------- assets ---------------------------------- */
 const HERO_IMG = new URL("./assets/hero.jpg", import.meta.url).href;
@@ -266,10 +271,11 @@ function greetingWord() {
 
 /* ------------------------------- storage layer ------------------------------ */
 
-// Signed out this is a hard ceiling on the device. Signed in the cloud holds the
-// durable copy, so it becomes a local cache budget instead and old photos are evicted
-// rather than refused — see the eviction effect in App.
-const TOTAL_QUOTA_MB = 20;
+// Only a fallback ceiling, used when the browser won't tell us the real one (older
+// Safari has no StorageManager). Everywhere else the meter reports what the browser
+// actually reports. The previous hardcoded 20MB was inherited from the Claude artifact
+// runtime and was four times what localStorage actually allows.
+const FALLBACK_QUOTA_MB = 50;
 const GALLERY_PAGE_SIZE = 20;
 const MAX_PHOTOS_PER_PICK = 5;
 function photoKey(date, period, id) { return `${date}:${period}:${id}`; }
@@ -445,6 +451,12 @@ export default function App() {
         }
         photoSizesRef.current = sizes || {};
         setPhotoSizes(sizes || {});
+
+        // Lift any photos an earlier build left in localStorage into IndexedDB. Safe to
+        // run every boot: each photo moves independently and it's a no-op once empty.
+        migrateLegacyPhotos().then((moved) => {
+          if (moved) console.info(`[glass] moved ${moved} photo(s) to IndexedDB`);
+        }).catch(() => {});
       } catch (e) {
         // A corrupt store must not strand the app on the boot screen forever.
         console.warn("[glass] boot read failed:", e?.message || e);
@@ -651,19 +663,17 @@ export default function App() {
       return value;
     };
 
-    try {
-      const r = await getStore().get(storageKeyFor(date, period, id));
-      if (r && r.value) return adopt(r.value);
-    } catch { /* nothing stored locally for this slot */ }
+    const local = await readPhoto(storageKeyFor(date, period, id));
+    if (local) return adopt(local);
 
     // Not on this device — a new phone, or one that evicted it to stay under budget.
     const remote = await fetchRemote(date, period, id);
     if (remote) {
-      persistRaw(storageKeyFor(date, period, id), remote);
+      writePhoto(storageKeyFor(date, period, id), remote).catch(() => {});
       return adopt(remote);
     }
     return null;
-  }, [persistJSON, persistRaw, fetchRemote, touchPhoto]);
+  }, [persistJSON, fetchRemote, touchPhoto]);
 
   // Decode + downscale a picked file WITHOUT touching stored state. Kept separate from
   // committing so a selection that turns out to be unreadable can't destroy the photos
@@ -690,7 +700,14 @@ export default function App() {
             canvas.height = Math.max(1, Math.round(img.height * scale));
             const ctx = canvas.getContext("2d");
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            resolve({ ok: true, dataUrl: canvas.toDataURL("image/jpeg", 0.72), id: genPhotoId() });
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+            // A Blob is what actually gets stored — base64 is a third larger and was the
+            // reason photos were fighting the localStorage cap. The data URL is kept only
+            // for the in-memory cache so the tile can paint immediately.
+            canvas.toBlob(
+              (blob) => resolve({ ok: true, dataUrl, blob: blob || null, id: genPhotoId() }),
+              "image/jpeg", 0.72
+            );
           } catch {
             resolve({ ok: false, error: "Something went wrong preparing that photo." });
           }
@@ -703,15 +720,24 @@ export default function App() {
 
   // Writes already-decoded photos to storage and updates the index in one pass.
   async function commitPhotos(date, period, items) {
-    await Promise.all(items.map((it) => persistRaw(`photo:${date}:${period}:${it.id}`, it.dataUrl)));
+    const sizeAdds = {};
+    pendingSaves.current += 1;
+    setSaveStatus("saving");
+    try {
+      await Promise.all(items.map(async (it) => {
+        const bytes = await writePhoto(`photo:${date}:${period}:${it.id}`, it.blob || it.dataUrl);
+        sizeAdds[photoKey(date, period, it.id)] = bytes;
+      }));
+      finishSave(true);
+    } catch (e) {
+      console.warn("[glass] photo write failed:", e?.message || e);
+      finishSave(false);
+      setPhotoError("Couldn't save that photo — this device may be out of space.");
+      return;
+    }
 
     const cacheAdds = {};
-    const sizeAdds = {};
-    items.forEach((it) => {
-      const ck = photoKey(date, period, it.id);
-      cacheAdds[ck] = it.dataUrl;
-      sizeAdds[ck] = approxBytes(it.dataUrl);
-    });
+    items.forEach((it) => { cacheAdds[photoKey(date, period, it.id)] = it.dataUrl; });
     setPhotoCache((c) => ({ ...c, ...cacheAdds }));
 
     const nextSizes = { ...photoSizesRef.current, ...sizeAdds };
@@ -738,7 +764,7 @@ export default function App() {
   async function deletePhotos(list) {
     // list: [{date, period, id}]
     if (!list.length) return;
-    await Promise.all(list.map(({ date, period, id }) => getStore().delete(storageKeyFor(date, period, id)).catch(() => {})));
+    await deletePhotoKeys(list.map(({ date, period, id }) => storageKeyFor(date, period, id)));
 
     setPhotoCache((c) => {
       const cc = { ...c };
@@ -771,13 +797,30 @@ export default function App() {
     return deletePhotos([{ date, period, id }]);
   }
 
-  // ---- storage quota estimate ----
+  // ---- storage ----
+  // Our own accounting, which is all we can attribute to *this* namespace.
   const photoBytesUsed = Object.values(photoSizes).reduce((a, b) => a + b, 0);
   const dataBytesUsed = approxBytes(JSON.stringify(products)) + approxBytes(JSON.stringify(logs))
     + approxBytes(JSON.stringify(photoIndex)) + approxBytes(JSON.stringify(photoSizes));
-  const totalBytesUsed = photoBytesUsed + dataBytesUsed;
-  const quotaUsedMB = totalBytesUsed / (1024 * 1024);
-  const quotaPct = Math.min(100, (quotaUsedMB / TOTAL_QUOTA_MB) * 100);
+  const ownBytes = photoBytesUsed + dataBytesUsed;
+
+  // What the browser says it's actually holding and actually allows. Asking beats
+  // guessing: the old meter reported a fixed 20MB ceiling that no browser ever offered.
+  const [storageEstimate, setStorageEstimate] = useState(null);
+  const refreshStorage = useCallback(async () => {
+    const est = await estimateStorage();
+    setStorageEstimate(est);
+  }, []);
+  useEffect(() => {
+    if (!ready) return undefined;
+    const t = setTimeout(refreshStorage, 400);
+    return () => clearTimeout(t);
+  }, [ready, ownBytes, refreshStorage]);
+
+  const MB = 1024 * 1024;
+  const quotaUsedMB = storageEstimate ? storageEstimate.usage / MB : ownBytes / MB;
+  const quotaTotalMB = storageEstimate ? storageEstimate.quota / MB : FALLBACK_QUOTA_MB;
+  const quotaPct = Math.min(100, quotaTotalMB ? (quotaUsedMB / quotaTotalMB) * 100 : 0);
 
   // First sign-in on a device that already has photos: hand the whole shelf to the
   // upload queue so nothing that predates the account is left behind. Once flushed the
@@ -803,7 +846,8 @@ export default function App() {
   useEffect(() => {
     if (!cloudEnabled || !identityKey || readyForRef.current !== identityKey) return;
     if (quotaPct <= 80) return;
-    const budget = TOTAL_QUOTA_MB * 1024 * 1024 * 0.7 - dataBytesUsed;
+    // Target 70% of whatever the browser actually allows, minus the non-photo data.
+    const budget = quotaTotalMB * MB * 0.7 - dataBytesUsed;
     const keep = new Set(
       ["am", "pm"].flatMap((p) => (photoIndexRef.current[selectedDate]?.[p] || [])
         .map((id) => photoKey(selectedDate, p, id)))
@@ -812,13 +856,12 @@ export default function App() {
     if (!drop.length) return;
 
     (async () => {
-      const store = getStore();
       const nextSizes = { ...photoSizesRef.current };
-      for (const ck of drop) {
+      await deletePhotoKeys(drop.map((ck) => {
         const [date, period, id] = ck.split(":");
-        try { await store.delete(storageKeyFor(date, period, id)); } catch { /* already gone */ }
-        delete nextSizes[ck];
-      }
+        return storageKeyFor(date, period, id);
+      }));
+      drop.forEach((ck) => { delete nextSizes[ck]; });
       photoSizesRef.current = nextSizes;
       setPhotoSizes(nextSizes);
       setPhotoCache((c) => {
@@ -915,6 +958,7 @@ export default function App() {
           loadPhoto={loadPhoto}
           quotaUsedMB={quotaUsedMB}
           quotaPct={quotaPct}
+          quotaTotalMB={quotaTotalMB}
           onExport={exportJSON}
       />
     ),
@@ -933,6 +977,7 @@ export default function App() {
           onDeleteMany={deletePhotos}
           quotaUsedMB={quotaUsedMB}
           quotaPct={quotaPct}
+          quotaTotalMB={quotaTotalMB}
           onExport={exportJSON}
       />
     ),
@@ -1035,6 +1080,8 @@ export default function App() {
             onExport={exportJSON}
             quotaUsedMB={quotaUsedMB}
             quotaPct={quotaPct}
+            quotaTotalMB={quotaTotalMB}
+          quotaTotalMB={quotaTotalMB}
             onClose={() => setAccountOpen(false)}
             onSignIn={auth.signInWithGoogle}
             onSignOut={async () => { setAccountOpen(false); await auth.signOut(); }}
@@ -1058,6 +1105,7 @@ export default function App() {
                 ["am", "pm"].forEach((period) => (slot?.[period] || [])
                   .forEach((id) => photoKeys.push(storageKeyFor(date, period, id))));
               });
+              await clearPhotosForNamespace();
               await clearNamespace(userId, photoKeys);
               setAccountOpen(false);
               window.location.reload();
@@ -2301,11 +2349,16 @@ function LazyPhoto({ date, period, id, loadPhoto, cached, size = 56, aspect = nu
           style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
         />
       ) : (
+        /* backgroundColor/backgroundImage rather than the `background` shorthand: mixing
+           the shorthand with backgroundSize makes React warn whenever this element
+           re-renders between placeholder states, which it now does while the blob is
+           fetched from IndexedDB. */
         <div style={{
           width: "100%", height: "100%",
-          background: requested
+          backgroundColor: requested ? "transparent" : "rgba(255,255,255,0.035)",
+          backgroundImage: requested
             ? "linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(243,201,140,0.09) 37%, rgba(255,255,255,0.03) 63%)"
-            : "rgba(255,255,255,0.035)",
+            : "none",
           backgroundSize: "400% 100%", animation: requested ? "shimmer 1.5s ease infinite" : "none",
           display: "flex", alignItems: "center", justifyContent: "center",
         }}>
@@ -3468,7 +3521,7 @@ function RetireReasonModal({ productName, usedToday, onClose, onConfirm }) {
 
 /* ------------------------------- insights view ------------------------------- */
 
-function InsightsView({ products, logs, photoIndex = {}, photoCache = {}, loadPhoto, quotaUsedMB = 0, quotaPct = 0, onExport }) {
+function InsightsView({ products, logs, photoIndex = {}, photoCache = {}, loadPhoto, quotaUsedMB = 0, quotaPct = 0, quotaTotalMB = 0, onExport }) {
   const dates = Object.keys(logs).sort();
   const hasAnyLogs = dates.length > 0;
   const todayD = todayStr();
@@ -4210,7 +4263,7 @@ function InsightsView({ products, logs, photoIndex = {}, photoCache = {}, loadPh
 
         {/* ---------- storage (canonical copy; Journey shows the same component) ---------- */}
         <Section title="Storage">
-          <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} hint="Photos are the bulk of this. Clean up old ones from Journey." />
+          <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} totalMB={quotaTotalMB} hint="Photos are the bulk of this. Clean up old ones from Journey." />
         </Section>
       </Body>
 
@@ -4259,14 +4312,16 @@ function HeaderAction({ icon: Icon, label, onClick }) {
 
 // One storage meter, used on both Insights and Journey. These were two different blocks
 // with different labels ("Used" vs "Storage used") and different markup.
-function StorageMeter({ usedMB, pct, hint }) {
+function StorageMeter({ usedMB, pct, hint, totalMB = 0 }) {
   const tight = pct > 85;
+  // Browser quotas run to gigabytes; showing "0.1 / 39321.6 MB" helps nobody.
+  const fmt = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`);
   return (
     <Card>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 9 }}>
         <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>Used</span>
         <span data-testid="storage-used" className="u-num" style={{ fontSize: 12, color: tight ? "var(--rose)" : "var(--text)", fontWeight: 600 }}>
-          {usedMB.toFixed(1)} <span style={{ color: "var(--text-3)", fontWeight: 400 }}>/ {TOTAL_QUOTA_MB} MB</span>
+          {fmt(usedMB)} <span style={{ color: "var(--text-3)", fontWeight: 400 }}>/ {fmt(totalMB)}</span>
         </span>
       </div>
       <div style={{ height: 6, borderRadius: 999, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
@@ -4579,7 +4634,7 @@ function buildMonthGrid(logs, year, month, photoIndex = {}, products = []) {
   return cells;
 }
 
-function JourneyView({ products, logs, selectedDate, setSelectedDate, setTab, photoIndex, photoCache, loadPhoto, onTriggerPhoto, onDelete, onDeleteMany, quotaUsedMB, quotaPct, onExport }) {
+function JourneyView({ products, logs, selectedDate, setSelectedDate, setTab, photoIndex, photoCache, loadPhoto, onTriggerPhoto, onDelete, onDeleteMany, quotaUsedMB, quotaPct, quotaTotalMB, onExport }) {
   const [showExport, setShowExport] = useState(false);
   const [monthOffset, setMonthOffset] = useState(0);
   const [calView, setCalView] = useState("month"); // 'month' | 'year'
@@ -5192,7 +5247,7 @@ function JourneyView({ products, logs, selectedDate, setSelectedDate, setTab, ph
         </Section>
 
         <Section title="Storage">
-          <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} hint="Cleaning up old photos above is the quickest way to free space." />
+          <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} totalMB={quotaTotalMB} hint="Cleaning up old photos above is the quickest way to free space." />
         </Section>
       </Body>
 
@@ -5641,7 +5696,7 @@ function SyncChoiceSheet({ local, remote, onChoose }) {
 function AccountView({
   profile, isGuest, authEnabled, displayName, greetingName, monogram,
   products, logs, syncStatus, lastSyncedAt, onSyncNow, onSetDisplayName,
-  onExport, quotaUsedMB, quotaPct, onClose, onSignIn, onSignOut, onDeleteEverything,
+  onExport, quotaUsedMB, quotaPct, quotaTotalMB, onClose, onSignIn, onSignOut, onDeleteEverything,
 }) {
   const reduce = useReducedMotion();
   const [showExport, setShowExport] = useState(false);
@@ -5779,7 +5834,7 @@ function AccountView({
                 ? "Photos live on this phone only. Sign in and they're backed up too."
                 : "What's cached here for offline use — your photos are safe in the cloud."}
             >
-              <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} />
+              <StorageMeter usedMB={quotaUsedMB} pct={quotaPct} totalMB={quotaTotalMB} />
             </Section>
           </StaggerItem>
 
