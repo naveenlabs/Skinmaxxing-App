@@ -50,11 +50,10 @@ export function GoogleMark({ size = 16 }) {
   );
 }
 
-// Replaces the inert monogram that used to sit in the Routine header. Same 34px chip,
-// now a real control that opens the account page.
-
-// Replaces the inert monogram that used to sit in the Routine header. Same 34px chip,
-// now a real control that opens the account page.
+// Replaces the inert monogram that used to sit in the Routine header. Now a real
+// control that opens the account page. Sized to Apple's 44pt minimum tap target --
+// the previous 34px chip was comfortably missable, especially in the top-right
+// corner where it also competes with the Control Center swipe-down gesture.
 export function AccountButton({ monogram, avatarUrl, onClick }) {
   const [broken, setBroken] = useState(false);
   const showImage = avatarUrl && !broken;
@@ -66,7 +65,7 @@ export function AccountButton({ monogram, avatarUrl, onClick }) {
       aria-label="Your account"
       className="u-tap"
       style={{
-        width: 34, height: 34, borderRadius: 999, border: "1px solid var(--line-3)",
+        width: 44, height: 44, borderRadius: 999, border: "1px solid var(--line-3)",
         display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
         overflow: "hidden", background: "rgba(10,7,5,0.42)", backdropFilter: "blur(8px)",
         WebkitBackdropFilter: "blur(8px)", flexShrink: 0,
@@ -78,7 +77,7 @@ export function AccountButton({ monogram, avatarUrl, onClick }) {
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
         />
       ) : (
-        <span className="u-display" style={{ fontSize: 15, color: "var(--gold)" }}>{monogram || "G"}</span>
+        <span className="u-display" style={{ fontSize: 18, color: "var(--gold)" }}>{monogram || "S"}</span>
       )}
     </motion.button>
   );
@@ -536,7 +535,7 @@ export function AccountView({
                       style={{ width: "100%", height: "100%", objectFit: "cover" }}
                     />
                   ) : (
-                    <span className="u-display" style={{ fontSize: 32, color: "var(--gold)" }}>{monogram || "G"}</span>
+                    <span className="u-display" style={{ fontSize: 32, color: "var(--gold)" }}>{monogram || "S"}</span>
                   )}
                 </span>
                 <span aria-hidden="true" style={{

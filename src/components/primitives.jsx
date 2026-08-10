@@ -270,7 +270,7 @@ export function PageHeader({ image, eyebrow, icon: Icon, title, italic, subtitle
         mixBlendMode: "screen",
       }} />
 
-      <div style={{ position: "relative", padding: "24px 20px 0", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+      <div style={{ position: "relative", padding: "calc(24px + env(safe-area-inset-top)) 20px 0", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
           {Icon && <Icon size={14} color="var(--gold)" strokeWidth={2} />}
           <span className="u-eyebrow" style={{ color: "var(--gold)" }}>{eyebrow}</span>
