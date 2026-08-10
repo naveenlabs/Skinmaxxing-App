@@ -1,8 +1,45 @@
+# Dependencies
 node_modules
+
+# Build output
 dist
-.DS_Store
+dist-ssr
+*.local
+
+# Vite / PWA generated service worker artifacts (emitted into dist, but pinned
+# here too in case a plugin config ever writes them to the project root)
+dev-dist
+
+# Environment — .env.example is the tracked template, everything else is secrets
 .env
 .env.*
 !.env.example
+
+# Deploy tooling
 .netlify
+
+# Editor / IDE
+.vscode
+.idea
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test / audit output. The audit scripts take an output directory argument and
+# default to /tmp, but pin these so a run pointed at the repo can't commit
+# screenshots or fixtures.
+/audit-output
+/test-results
+/playwright-report
+
+# Local agent tooling (machine-specific, not shared config)
 .claude/settings.local.json
+.mcp.json

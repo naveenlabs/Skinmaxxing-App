@@ -1,25 +1,41 @@
 {
-  "name": "skinmaxxing-preview",
+  "name": "skinmaxxing",
+  "version": "1.0.0",
   "private": true,
-  "version": "0.0.0",
   "type": "module",
+  "description": "An installable PWA for tracking an AM/PM skincare routine, product shelf, and progress photos. Local-first, with optional Google sign-in and cloud sync.",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/naveenlabs/Skinmaxxing-App.git"
+  },
+  "homepage": "https://skinmaxxing.netlify.app",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+
     "verify": "npm run verify:merge && npm run verify:p1 && npm run verify:p2 && npm run verify:auth && npm run verify:identity && npm run verify:offline && npm run verify:storage2 && npm run verify:account",
-    "verify:identity": "node scripts/audit/identity-check.mjs /tmp/glass-identity",
-    "verify:offline": "node scripts/audit/offline-check.mjs /tmp/glass-offline",
-    "verify:account": "node scripts/audit/account-check.mjs /tmp/glass-account",
-    "verify:storage2": "node scripts/audit/storage-check.mjs /tmp/glass-storage",
+    "verify:merge": "node scripts/audit/merge-check.mjs",
     "verify:p1": "node scripts/audit/verify-p1.mjs /tmp/glass-verify /tmp/glass-fixtures",
     "verify:p2": "node scripts/audit/verify-p2.mjs /tmp/glass-p2",
-    "verify:merge": "node scripts/audit/merge-check.mjs",
     "verify:auth": "node scripts/audit/auth-check.mjs /tmp/glass-auth",
+    "verify:identity": "node scripts/audit/identity-check.mjs /tmp/glass-identity",
+    "verify:offline": "node scripts/audit/offline-check.mjs /tmp/glass-offline",
+    "verify:storage2": "node scripts/audit/storage-check.mjs /tmp/glass-storage",
+    "verify:account": "node scripts/audit/account-check.mjs /tmp/glass-account",
     "verify:storage": "node scripts/audit/artifact-storage.mjs",
+    "verify:a11y": "node scripts/audit/a11y-motion.mjs /tmp/glass-a11y",
+    "verify:prod": "node scripts/audit/prod-check.mjs",
+
     "fixtures": "node scripts/audit/mkfixtures.mjs /tmp/glass-fixtures",
     "shots": "node scripts/audit/snap.mjs /tmp/glass-shots",
-    "shots:states": "node scripts/audit/snap-states.mjs /tmp/glass-shots"
+    "shots:states": "node scripts/audit/snap-states.mjs /tmp/glass-shots",
+    "check:phone": "node scripts/audit/phone-check.mjs /tmp/glass-phone",
+    "design:palette": "node scripts/audit/palette.mjs"
   },
   "dependencies": {
     "@fontsource-variable/plus-jakarta-sans": "^5.3.0",

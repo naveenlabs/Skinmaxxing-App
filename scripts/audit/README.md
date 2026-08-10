@@ -72,17 +72,35 @@ npm run shots           # all four pages at four scroll depths
 npm run shots:states    # empty states, every bottom sheet, kebab menu, lightbox, year view
 ```
 
+## The account, identity and storage suites
+
+Added with cloud sync. These guard the failure modes that only exist once data can
+belong to somebody.
+
+| Command | What it guards |
+|---|---|
+| `verify:identity` | **The cross-account leak.** Seeds as A, signs out, signs in as B, and asserts zero bytes of A's products, logs, photo index or name reach B's row or B's screen. Repeated for A→guest→B, guest→A→B and A→guest→A. This is the one that must never regress. |
+| `verify:offline` | An access token expires hourly. Offline with a stale token you stay in your own namespace, read-write — not dumped on a sign-in wall with your routine unreachable behind it. |
+| `verify:account` | Guest lifecycle and guest→account conversion (offered for a new account, never merged into an existing one, guest copy never destroyed), avatars, that Google is the only door, that a guest can name themselves and the name never leaves the device, and that "Delete everything" signs you out rather than leaving you in an empty account. |
+| `verify:storage2` | Migration of legacy base64 photos into IndexedDB, the meter against the real quota, and that one namespace's photos never surface in another. |
+
+## Other tools
+
+| Command | Purpose |
+|---|---|
+| `verify:a11y` | Usable under `prefers-reduced-motion`; every interactive element has an accessible name. |
+| `verify:prod` | Console-clean smoke pass over a production-shaped build. |
+| `check:phone` | Served over the LAN on a real device: the desktop mockup chrome drops away and nothing scrolls horizontally. Takes a URL. |
+| `design:palette` | Samples dominant colours out of `src/assets/*` — how the palette in `styles/theme.js` was derived. |
+
 ## Files
 
 - `drive.mjs` — boots a browser with a seeded dataset; `go(page, tab)` navigates.
 - `seed.mjs` — builds a deterministic ~150-day dataset (logs, moods, notes, weekly
   reflections, 21 photos spread so 30/90-day compare has real targets).
 - `mkfixtures.mjs` — generates valid JPEGs for upload tests.
-- `palette.mjs` — samples dominant colours out of `src/assets/*` (this is how the
-  palette in `GLOBAL_CSS` was derived).
-- `compose.mjs` — builds side-by-side before/after composites.
-- `p1-*.mjs` — the original exploratory audits, kept as documentation of how each bug
-  was reproduced.
 
-Tests select on `data-testid` attributes, not on styling, so a visual change doesn't
-break them.
+Tests select on `data-testid` attributes and accessible names, not on styling, so a
+visual change doesn't break them. The Supabase REST, auth and storage endpoints are
+intercepted with `page.route()`, so no suite needs a real backend — which is also why
+they all still run with `VITE_SUPABASE_*` unset.

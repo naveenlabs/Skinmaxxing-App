@@ -1,4 +1,4 @@
-# Glass — backend setup
+# Skinmaxxing — backend setup
 
 Everything the app needs that can't live in the repo. Run the SQL in the Supabase SQL
 editor, then set the dashboard options listed at the bottom.
