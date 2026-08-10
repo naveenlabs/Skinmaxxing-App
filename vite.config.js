@@ -32,8 +32,8 @@ export default defineConfig({
         ],
       },
       manifest: {
-        name: "Glass",
-        short_name: "Glass",
+        name: "Skinmaxxing",
+        short_name: "Skinmaxxing",
         description: "AM/PM skincare routine tracker",
         theme_color: "#0A0705",
         background_color: "#0A0705",

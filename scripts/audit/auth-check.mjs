@@ -39,7 +39,7 @@ await page.waitForTimeout(1600);
 
 const gate = await page.evaluate(() => document.body.innerText);
 check("sign-in screen replaces the app", /Continue with Google/.test(gate));
-check("brand line present", /Welcome to/.test(gate) && /Glass\./.test(gate));
+check("brand line present", /Welcome to/.test(gate) && /Skinmaxxing\./.test(gate));
 check("guest escape hatch is offered", /Continue without an account/.test(gate));
 check("routine is not reachable behind the gate", !/Good (Morning|Afternoon|Evening)/.test(gate));
 await page.screenshot({ path: `${OUT}/shots/auth-signin.png` });

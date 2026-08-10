@@ -185,7 +185,7 @@ function computeExportData(products, logs, photoIndex, photoSizes) {
 
   return {
     exportedAt: new Date().toISOString(),
-    app: "Glass — AM/PM skincare routine tracker",
+    app: "Skinmaxxing — AM/PM skincare routine tracker",
     notes: "dailyLogs contains the complete raw daily record — every field the user ever entered. The insights/productStats blocks below are pre-computed conveniences derived from that same raw data, not additional information, so any question can in principle be answered directly from dailyLogs even if not explicitly precomputed here. Products deleted from the shelf still appear in dailyLogs (marked as deleted) but contribute no productStats or categoryBalance rows, since their category was deleted with them.",
     definitions: {
       dayCompletion: "A day counts as fully complete once every must-have category in that day's default routine is checked in both periods. Must-have categories are cleanser + moisturizer + sunscreen for AM, cleanser + moisturizer for PM. Having two products in one must-have category only requires one of them. Which products counted on a given day comes from each product's routinePeriods (see below), NOT from its status today — so retiring a product never changes a past day's score.",
@@ -281,6 +281,12 @@ function greetingWord() {
 // actually reports. The previous hardcoded 20MB was inherited from the Claude artifact
 // runtime and was four times what localStorage actually allows.
 const FALLBACK_QUOTA_MB = 50;
+
+// The real ceiling for a signed-in account: the `limit_bytes` constant in the
+// enforce_photo_quota trigger (docs/SETUP.md section 3) — this is what actually refuses
+// a write, on Supabase's side, regardless of how much free disk this device has. Keep
+// the two in sync if either changes.
+const ACCOUNT_PHOTO_QUOTA_MB = 200;
 const GALLERY_PAGE_SIZE = 20;
 const MAX_PHOTOS_PER_PICK = 5;
 function photoKey(date, period, id) { return `${date}:${period}:${id}`; }
@@ -721,7 +727,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `glass-export-${todayStr()}.json`;
+    a.download = `skinmaxxing-export-${todayStr()}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -949,8 +955,18 @@ export default function App() {
   }, [ready, ownBytes, refreshStorage]);
 
   const MB = 1024 * 1024;
-  const quotaUsedMB = storageEstimate ? storageEstimate.usage / MB : ownBytes / MB;
-  const quotaTotalMB = storageEstimate ? storageEstimate.quota / MB : FALLBACK_QUOTA_MB;
+  // Signed in (or offline with a cached session), the number that matters is the real
+  // server-enforced cap, not what this particular device's disk happens to allow —
+  // navigator.storage.estimate().quota answers "how much could this origin theoretically
+  // use," which on a phone with space free reads in the tens of GB. That mismatch is
+  // exactly what showed "38.4 GB" to someone whose account is actually capped at 200MB.
+  // Guest data never reaches a server, so for a guest the browser's own grant IS the real
+  // ceiling, and asking beats guessing (see FALLBACK_QUOTA_MB above).
+  const hasAccount = cloudEnabled || auth.offline;
+  const quotaUsedMB = ownBytes / MB;
+  const quotaTotalMB = hasAccount
+    ? ACCOUNT_PHOTO_QUOTA_MB
+    : (storageEstimate ? storageEstimate.quota / MB : FALLBACK_QUOTA_MB);
   const quotaPct = Math.min(100, quotaTotalMB ? (quotaUsedMB / quotaTotalMB) * 100 : 0);
 
   // First sign-in on a device that already has photos: hand the whole shelf to the
@@ -1035,7 +1051,7 @@ export default function App() {
             className="u-display"
             style={{ fontSize: 42, letterSpacing: "0.14em", color: "var(--gold)" }}
           >
-            GLASS
+            SKINMAXXING
           </motion.div>
           <motion.div
             initial={{ width: 0 }} animate={{ width: 64 }}
@@ -1052,8 +1068,10 @@ export default function App() {
   // A chosen display name wins over Google's, so the greeting can still read exactly
   // "Naveen." even when the account says something more formal.
   const greetingName = (displayName || auth.profile?.givenName || "").trim();
-  const monogram = (greetingName || auth.profile?.email || "G").trim().charAt(0).toUpperCase();
-  const avatarUrl = auth.profile?.avatarUrl || "";
+  const monogram = (greetingName || auth.profile?.email || "S").trim().charAt(0).toUpperCase();
+  // A custom upload always wins — this is the same priority AccountView uses, so the
+  // Today page's button stops showing Google's photo (or nothing) after someone sets one.
+  const avatarUrl = avatarDataUrl || auth.profile?.avatarUrl || "";
 
   const pages = {
     today: (
@@ -1242,6 +1260,12 @@ export default function App() {
               await clearPhotosForNamespace();
               await clearNamespace(userId, photoKeys);
               setAccountOpen(false);
+              // Wiping the data isn't enough on its own — a live Supabase session survives
+              // it, so the reload below would just sign the same account back into its own
+              // now-empty namespace instead of returning to the sign-in screen. Awaited so
+              // the session is actually cleared from storage before the page unloads.
+              if (auth.isGuest) await auth.exitGuest();
+              else await auth.signOut();
               window.location.reload();
               return { ok: true };
             }}
@@ -5637,7 +5661,7 @@ function SignInScreen({ onGoogle, onGuest, error, onDismissError }) {
           </div>
           <h1 className="u-display" style={{ fontSize: 46, color: "var(--text)", margin: 0, lineHeight: 1.02 }}>
             Welcome to<br />
-            <span style={{ fontStyle: "italic", color: "var(--gold)" }}>Glass.</span>
+            <span style={{ fontStyle: "italic", color: "var(--gold)" }}>Skinmaxxing.</span>
           </h1>
           <p style={{ fontSize: 13.5, color: "var(--text-2)", margin: "16px 0 0", maxWidth: 280, lineHeight: 1.6 }}>
             Your AM and PM routine, every product on your shelf, and the progress to prove
@@ -6186,7 +6210,7 @@ function GuestOfferSheet({ mode, summary, onAnswer }) {
         <SheetHeader
           id="guest-offer-title"
           title="Bring your routine with you?"
-          subtitle="You'd been using Glass without an account. That data is still on this phone."
+          subtitle="You'd been using Skinmaxxing without an account. That data is still on this phone."
           onClose={() => onAnswer(false)}
         />
         <div style={{

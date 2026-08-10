@@ -190,6 +190,13 @@ check("avatar is stored locally", await page.evaluate(async (ns) => {
   });
   return keys.includes(`${ns}avatar`);
 }, `u_${U.id}:`));
+// The AccountView overlay sits alongside the Today page in the DOM rather than replacing
+// it, so the routine page's own account button is reachable without closing the overlay.
+// It used to be wired to Google's photo only, so a custom upload never showed there.
+const heroAvatarSrc = await page.locator('button[aria-label="Your account"] img').first()
+  .getAttribute("src").catch(() => null);
+check("routine page avatar updates immediately, not just the account sheet",
+  !!heroAvatarSrc && heroAvatarSrc.startsWith("data:"), String(heroAvatarSrc).slice(0, 40));
 await page.screenshot({ path: `${OUT}/shots/account-avatar.png` });
 
 await page.getByLabel(/profile picture/i).first().click();
@@ -280,6 +287,43 @@ await page.reload({ waitUntil: "networkidle" });
 await page.waitForTimeout(2000);
 check("it survives a reload", /Good (Morning|Afternoon|Evening),\s*Dana\./i.test(await bodyText()));
 check("a guest name never leaves the device", writes.every((w) => w.display_name !== "Dana"));
+
+/* ======== 8. signed-in storage quota is the real 200MB cap ======== */
+// The meter used navigator.storage.estimate().quota as the ceiling for every user,
+// including signed-in accounts — that's the browser's raw disk allowance, unrelated to
+// the number Supabase actually enforces (enforce_photo_quota, docs/SETUP.md section 3).
+// On a phone with space free that read in the tens of GB instead of 200MB.
+
+await page.evaluate(() => localStorage.clear());
+rows = new Map();
+await page.evaluate(() => localStorage.setItem("glass:auth-mode", "account"));
+await page.reload({ waitUntil: "networkidle" });
+await signIn();
+await page.waitForTimeout(2500);
+await page.getByLabel("Your account").first().click();
+await page.waitForTimeout(1200);
+const meterText = await page.locator('[data-testid="storage-used"]').first().innerText().catch(() => "");
+check("storage meter renders for a signed-in account", meterText.length > 0, meterText);
+check("ceiling is the real 200MB account cap, not the browser's raw quota",
+  /\/\s*200\.0\s*MB/.test(meterText), meterText);
+check("ceiling is not reported in GB (that was the bug)", !/GB/.test(meterText), meterText);
+await page.screenshot({ path: `${OUT}/shots/account-storage-quota.png` });
+
+/* ======== 9. delete everything signs the account out completely ======== */
+// Wiping the data used to leave a live Supabase session in place, so the reload right
+// after just signed the same account back into its own now-empty namespace — the data
+// was gone but the person never left the account. This is the fix for that: it must land
+// back on the sign-in screen, not a blank routine while still "signed in".
+
+await page.getByText("Delete everything").click();
+await page.waitForTimeout(500);
+check("delete confirmation is shown", /Delete everything\?/.test(await bodyText()));
+await page.getByRole("button", { name: "Delete it all" }).click();
+await page.waitForTimeout(3000);
+const afterWipe = await bodyText();
+check("delete everything signs the account out", /Continue with Google/.test(afterWipe), afterWipe.slice(0, 160));
+check("not left signed in behind an empty routine", !/Good (Morning|Afternoon|Evening)/.test(afterWipe));
+await page.screenshot({ path: `${OUT}/shots/account-delete-everything.png` });
 
 check("no page errors", errors.length === 0, errors.join(" | "));
 

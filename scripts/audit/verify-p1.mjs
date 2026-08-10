@@ -87,7 +87,7 @@ function check(name, ok, detail = "") {
   await f.saveAs(jp);
   const j = JSON.parse(fs.readFileSync(jp, "utf8"));
   check("export agrees with the UI streak", String(j.insights.currentOverallStreak) === routineStreak, `export=${j.insights.currentOverallStreak}`);
-  check("export filename uses the app name", f.suggestedFilename().startsWith("glass-export-"), f.suggestedFilename());
+  check("export filename uses the app name", f.suggestedFilename().startsWith("skinmaxxing-export-"), f.suggestedFilename());
   check("export documents its own definitions", !!j.definitions && !!j.definitions.dayCompletion);
   check("console clean (streak)", messages.length === 0, messages.join(" | "));
   await browser.close();
