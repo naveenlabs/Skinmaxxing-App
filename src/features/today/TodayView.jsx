@@ -193,13 +193,13 @@ export function RoutineSection({ title, subtitle, period, tone, icon: Icon, prod
                     </motion.div>
 
                     <div style={{
-                      width: 60, height: 60, borderRadius: 16, flexShrink: 0, overflow: "hidden",
+                      width: 80, height: 80, borderRadius: 22, flexShrink: 0, overflow: "hidden",
                       background: "rgba(255,255,255,0.045)", border: "1px solid var(--line)",
                       display: "flex", alignItems: "center", justifyContent: "center",
                     }}>
                       {p.photo
-                        ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                        : <Package size={19} color="var(--text-3)" strokeWidth={1.6} />}
+                        ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scale(1.15)" }} />
+                        : <Package size={25} color="var(--text-3)" strokeWidth={1.6} />}
                     </div>
 
                     <div style={{ flex: 1, minWidth: 0 }}>
@@ -380,7 +380,7 @@ export function DayStepsSheet({ period, date, products, routine, onClose, onAdd,
         display: "flex", alignItems: "center", justifyContent: "center", opacity: dim ? 0.5 : 1,
       }}>
         {p.photo
-          ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scale(1.15)" }} />
           : <Package size={14} color="var(--text-3)" strokeWidth={1.6} />}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>

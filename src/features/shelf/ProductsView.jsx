@@ -129,7 +129,7 @@ export function ProductEditor({ product, onClose, onSave, onDelete }) {
             }}
           >
             {photo ? (
-              <img src={photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+              <img src={photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scale(1.15)", display: "block" }} />
             ) : (
               <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 5 }}>
                 <Camera size={17} color="var(--text-3)" />
@@ -491,7 +491,7 @@ export function ProductsView({ products, logs, onAdd, onUpdate, onDelete, onReor
                           }}
                         >
                           {p.photo
-                            ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                            ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scale(1.15)" }} />
                             : <Icon size={20} color="var(--text-3)" strokeWidth={1.5} />}
                         </button>
 
