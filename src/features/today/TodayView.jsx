@@ -193,13 +193,13 @@ export function RoutineSection({ title, subtitle, period, tone, icon: Icon, prod
                     </motion.div>
 
                     <div style={{
-                      width: 50, height: 50, borderRadius: 14, flexShrink: 0, overflow: "hidden",
+                      width: 60, height: 60, borderRadius: 16, flexShrink: 0, overflow: "hidden",
                       background: "rgba(255,255,255,0.045)", border: "1px solid var(--line)",
                       display: "flex", alignItems: "center", justifyContent: "center",
                     }}>
                       {p.photo
                         ? <img src={p.photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                        : <Package size={17} color="var(--text-3)" strokeWidth={1.6} />}
+                        : <Package size={19} color="var(--text-3)" strokeWidth={1.6} />}
                     </div>
 
                     <div style={{ flex: 1, minWidth: 0 }}>

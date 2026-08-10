@@ -61,14 +61,14 @@ export function compressProductPhoto(file, onDone) {
   reader.onload = (e) => {
     const img = new window.Image();
     img.onload = () => {
-      const maxW = 480;
+      const maxW = 640;
       const scale = Math.min(1, maxW / img.width);
       const canvas = document.createElement("canvas");
       canvas.width = img.width * scale;
       canvas.height = img.height * scale;
       const ctx = canvas.getContext("2d");
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      onDone(canvas.toDataURL("image/jpeg", 0.88));
+      onDone(canvas.toDataURL("image/jpeg", 0.95));
     };
     img.src = e.target.result;
   };
