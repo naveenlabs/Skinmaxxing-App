@@ -462,12 +462,14 @@ export default function App() {
     (async () => {
       const local = await readAvatar();
       if (!alive || identityKeyRef.current !== epoch) return;
-      if (local) { setAvatarDataUrl(local); return; }
+      if (local) setAvatarDataUrl(local); // instant paint — may be stale, cloud check below corrects it
       if (!cloudEnabled) return;
       const remote = await fetchAvatar();
       if (!alive || identityKeyRef.current !== epoch || !remote) return;
+      // A different surface (installed PWA vs. browser tab) can hold its own stale local
+      // cache forever if we stop here on a local hit — always trust the cloud once reachable.
       setAvatarDataUrl(remote);
-      writeAvatar(remote).catch(() => {}); // cache it so it renders offline next time
+      writeAvatar(remote).catch(() => {}); // refresh the cache so it still renders offline
     })();
     return () => { alive = false; };
   }, [identityKey, ready, cloudEnabled, fetchAvatar]);

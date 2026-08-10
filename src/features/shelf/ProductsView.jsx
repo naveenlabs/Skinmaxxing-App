@@ -61,14 +61,14 @@ export function compressProductPhoto(file, onDone) {
   reader.onload = (e) => {
     const img = new window.Image();
     img.onload = () => {
-      const maxW = 320;
+      const maxW = 480;
       const scale = Math.min(1, maxW / img.width);
       const canvas = document.createElement("canvas");
       canvas.width = img.width * scale;
       canvas.height = img.height * scale;
       const ctx = canvas.getContext("2d");
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      onDone(canvas.toDataURL("image/jpeg", 0.75));
+      onDone(canvas.toDataURL("image/jpeg", 0.88));
     };
     img.src = e.target.result;
   };
@@ -485,7 +485,8 @@ export function ProductsView({ products, logs, onAdd, onUpdate, onDelete, onReor
                           className="u-tap"
                           aria-label={`Edit ${p.name}`}
                           style={{
-                            width: 86, flexShrink: 0, background: "rgba(255,255,255,0.03)", border: "none",
+                            width: 86, height: 86, flexShrink: 0, alignSelf: "flex-start", margin: 10,
+                            borderRadius: 16, background: "rgba(255,255,255,0.03)", border: "none",
                             display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",
                           }}
                         >
